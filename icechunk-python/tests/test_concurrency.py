@@ -12,7 +12,7 @@ from termcolor import colored
 
 import icechunk
 import zarr
-from tests.conftest import write_chunks_to_minio
+from tests.conftest import Permission, write_chunks_to_minio
 
 N = 15
 
@@ -122,7 +122,7 @@ async def test_thread_concurrency(any_spec_version: int | None) -> None:
     config = icechunk.RepositoryConfig.default()
     store_config = icechunk.s3_store(
         region="us-east-1",
-        endpoint_url="http://localhost:9000",
+        endpoint_url="http://localhost:4200",
         allow_http=True,
         force_path_style=True,
         s3_compatible=True,
@@ -130,23 +130,25 @@ async def test_thread_concurrency(any_spec_version: int | None) -> None:
     container = icechunk.VirtualChunkContainer("s3://testbucket/", store_config)
     config.set_virtual_chunk_container(container)
     config.inline_chunk_threshold_bytes = 0
+    access_key_id, secret_access_key = Permission.MODIFY.keys()
     credentials = icechunk.containers_credentials(
         {
             "s3://testbucket": icechunk.s3_credentials(
-                access_key_id="minio123", secret_access_key="minio123"
+                access_key_id=access_key_id,
+                secret_access_key=secret_access_key,
             )
         }
     )
 
     storage = icechunk.s3_storage(
         region="us-east-1",
-        endpoint_url="http://localhost:9000",
+        endpoint_url="http://localhost:4200",
         allow_http=True,
         force_path_style=True,
         bucket="testbucket",
         prefix="multithreaded-test__" + str(time.time()),
-        access_key_id="minio123",
-        secret_access_key="minio123",
+        access_key_id=access_key_id,
+        secret_access_key=secret_access_key,
     )
 
     # Open the store
@@ -251,7 +253,7 @@ async def test_thread_concurrency(any_spec_version: int | None) -> None:
             lists.append(pool.submit(do_lists, start, stop))
 
         start.set()
-        time.sleep(SECONDS_TO_RUN)
+        await asyncio.sleep(SECONDS_TO_RUN)
         stop.set()
 
         virtual_writes_count = sum(future.result() for future in virtual_writes)

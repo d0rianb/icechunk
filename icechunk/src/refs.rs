@@ -1,12 +1,16 @@
+//! Branch and tag management.
+//!
+//! This module handles named references (branches and tags) that point to snapshots.
+
 use std::{collections::BTreeSet, future::ready, pin::Pin};
 
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use futures::{
-    FutureExt, StreamExt, TryStreamExt as _,
+    FutureExt as _, StreamExt as _, TryStreamExt as _,
     stream::{FuturesOrdered, FuturesUnordered},
 };
-use itertools::Itertools;
+use itertools::Itertools as _;
 use serde::{Deserialize, Serialize};
 use serde_with::{TryFromInto, serde_as};
 use thiserror::Error;
@@ -17,13 +21,14 @@ use crate::{
     Storage, StorageError,
     error::ICError,
     format::{SnapshotId, V1_REFS_FILE_PATH},
-    storage::{self, StorageErrorKind, VersionInfo, VersionedUpdateResult},
+    storage::{StorageContext, StorageErrorKind, VersionInfo, VersionedUpdateResult},
 };
+use icechunk_types::{ICResultExt as _, error::ICResultCtxExt as _};
 
 #[derive(Debug, Error)]
 pub enum RefErrorKind {
     #[error(transparent)]
-    Storage(StorageErrorKind),
+    Storage(#[from] StorageErrorKind),
 
     #[error("ref not found `{0}`")]
     RefNotFound(String),
@@ -49,33 +54,19 @@ pub enum RefErrorKind {
 
 pub type RefError = ICError<RefErrorKind>;
 
-// it would be great to define this impl in error.rs, but it conflicts with the blanket
-// `impl From<T> for T`
-impl<E> From<E> for RefError
-where
-    E: Into<RefErrorKind>,
-{
-    fn from(value: E) -> Self {
-        Self::new(value.into())
-    }
-}
-
-impl From<StorageError> for RefError {
-    fn from(value: StorageError) -> Self {
-        Self::with_context(RefErrorKind::Storage(value.kind), value.context)
-    }
-}
-
 pub type RefResult<A> = Result<A, RefError>;
 
+/// A named reference to a snapshot: either a branch or a tag.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub enum Ref {
+    /// Immutable reference to a specific snapshot.
     Tag(String),
+    /// Mutable reference that advances with new commits.
     Branch(String),
 }
 
 impl Ref {
-    pub const DEFAULT_BRANCH: &'static str = "main";
+    pub const DEFAULT_BRANCH: &'static str = icechunk_types::DEFAULT_BRANCH;
 
     pub fn name(&self) -> &str {
         match self {
@@ -89,7 +80,9 @@ impl Ref {
             Some(name) => Ok(Ref::Tag(name.to_string())),
             None => match path.strip_prefix("branch.") {
                 Some(name) => Ok(Ref::Branch(name.to_string())),
-                None => Err(RefErrorKind::InvalidRefType(path.to_string()).into()),
+                None => {
+                    Err(RefError::capture(RefErrorKind::InvalidRefType(path.to_string())))
+                }
             },
         }
     }
@@ -111,15 +104,16 @@ impl Ref {
     pub async fn fetch(
         &self,
         storage: &(dyn Storage + Send + Sync),
-        storage_settings: &storage::Settings,
+        ctx: &StorageContext<'_>,
     ) -> RefResult<RefData> {
         match self {
-            Ref::Tag(name) => fetch_tag(storage, storage_settings, name).await,
-            Ref::Branch(name) => fetch_branch_tip(storage, storage_settings, name).await,
+            Ref::Tag(name) => fetch_tag(storage, ctx, name).await,
+            Ref::Branch(name) => fetch_branch_tip_v1(storage, ctx, name).await,
         }
     }
 }
 
+/// Data stored for a reference: the snapshot ID it points to.
 #[serde_as]
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RefData {
@@ -132,7 +126,9 @@ const TAG_DELETE_MARKER_KEY_NAME: &str = "ref.json.deleted";
 
 fn tag_key(tag_name: &str) -> RefResult<String> {
     if tag_name.contains('/') {
-        return Err(RefErrorKind::InvalidRefName(tag_name.to_string()).into());
+        return Err(RefError::capture(RefErrorKind::InvalidRefName(
+            tag_name.to_string(),
+        )));
     }
 
     Ok(format!("tag.{tag_name}/{REF_KEY_NAME}"))
@@ -140,7 +136,9 @@ fn tag_key(tag_name: &str) -> RefResult<String> {
 
 fn tag_delete_marker_key(tag_name: &str) -> RefResult<String> {
     if tag_name.contains('/') {
-        return Err(RefErrorKind::InvalidRefName(tag_name.to_string()).into());
+        return Err(RefError::capture(RefErrorKind::InvalidRefName(
+            tag_name.to_string(),
+        )));
     }
 
     Ok(format!("tag.{tag_name}/{TAG_DELETE_MARKER_KEY_NAME}"))
@@ -148,25 +146,27 @@ fn tag_delete_marker_key(tag_name: &str) -> RefResult<String> {
 
 fn branch_key(branch_name: &str) -> RefResult<String> {
     if branch_name.contains('/') {
-        return Err(RefErrorKind::InvalidRefName(branch_name.to_string()).into());
+        return Err(RefError::capture(RefErrorKind::InvalidRefName(
+            branch_name.to_string(),
+        )));
     }
     Ok(format!("branch.{branch_name}/{REF_KEY_NAME}"))
 }
 
-#[instrument(skip(storage, storage_settings))]
+#[instrument(skip(storage, ctx))]
 pub async fn create_tag(
     storage: &(dyn Storage + Send + Sync),
-    storage_settings: &storage::Settings,
+    ctx: &StorageContext<'_>,
     name: &str,
     snapshot: SnapshotId,
 ) -> RefResult<()> {
     let key = tag_key(name)?;
     let path = format!("{V1_REFS_FILE_PATH}/{key}");
     let data = RefData { snapshot };
-    let content = serde_json::to_vec(&data)?;
+    let content = serde_json::to_vec(&data).capture()?;
     match storage
         .put_object(
-            storage_settings,
+            ctx,
             path.as_str(),
             Bytes::from_owner(content),
             Some("application/json"),
@@ -177,22 +177,22 @@ pub async fn create_tag(
     {
         Ok(VersionedUpdateResult::Updated { .. }) => Ok(()),
         Ok(VersionedUpdateResult::NotOnLatestVersion) => {
-            Err(RefErrorKind::TagAlreadyExists(name.to_string()).into())
+            Err(RefError::capture(RefErrorKind::TagAlreadyExists(name.to_string())))
         }
-        Err(err) => Err(err.into()),
+        Err(err) => Err(err.inject()),
     }
 }
 
 #[async_recursion]
-#[instrument(skip(storage, storage_settings))]
+#[instrument(skip(storage, ctx))]
 pub async fn update_branch(
     storage: &(dyn Storage + Send + Sync),
-    storage_settings: &storage::Settings,
+    ctx: &StorageContext<'_>,
     name: &str,
     new_snapshot: SnapshotId,
     current_snapshot: Option<&SnapshotId>,
 ) -> RefResult<VersionInfo> {
-    let (ref_data, version) = match fetch_branch(storage, storage_settings, name).await {
+    let (ref_data, version) = match fetch_branch(storage, ctx, name).await {
         Ok((ref_data, version)) => (Some(ref_data), version),
         Err(RefError { kind: RefErrorKind::RefNotFound(..), .. }) => {
             (None, VersionInfo::for_creation())
@@ -206,17 +206,17 @@ pub async fn update_branch(
         return Err(RefErrorKind::Conflict {
             expected_parent: current_snapshot.cloned(),
             actual_parent: ref_data.map(|rd| rd.snapshot),
-        }
-        .into());
+        })
+        .capture();
     }
 
     let key = branch_key(name)?;
     let path = format!("{V1_REFS_FILE_PATH}/{key}");
     let data = RefData { snapshot: new_snapshot };
-    let content = serde_json::to_vec(&data)?;
+    let content = serde_json::to_vec(&data).capture()?;
     match storage
         .put_object(
-            storage_settings,
+            ctx,
             path.as_str(),
             Bytes::from_owner(content),
             Some("application/json"),
@@ -229,38 +229,31 @@ pub async fn update_branch(
         Ok(VersionedUpdateResult::NotOnLatestVersion) => {
             // If the already exists, an update happened since we checked
             // we can just try again and the conflict will be reported
-            update_branch(
-                storage,
-                storage_settings,
-                name,
-                data.snapshot,
-                current_snapshot,
-            )
-            .await
+            update_branch(storage, ctx, name, data.snapshot, current_snapshot).await
         }
 
-        Err(err) => Err(err.into()),
+        Err(err) => Err(err.inject()),
     }
 }
 
-fn ref_name_from_object_name(key: String) -> Option<String> {
+fn ref_name_from_object_name(key: &str) -> Option<String> {
     let ref_name = key.split('/').next()?;
     Some(ref_name.to_string())
 }
 
-#[instrument(skip(storage, storage_settings))]
+#[instrument(skip(storage, ctx))]
 pub async fn list_refs(
     storage: &(dyn Storage + Send + Sync),
-    storage_settings: &storage::Settings,
+    ctx: &StorageContext<'_>,
 ) -> RefResult<BTreeSet<Ref>> {
     let all = storage
-        .list_objects(storage_settings, format!("{V1_REFS_FILE_PATH}/").as_str())
-        .await?
-        .map_ok(|li| ref_name_from_object_name(li.id));
-    //let all = storage.ref_names(storage_settings).await?;
+        .list_objects(ctx, format!("{V1_REFS_FILE_PATH}/").as_str())
+        .await
+        .inject()?
+        .map_ok(|li| ref_name_from_object_name(&li.id));
     let candidate_refs: BTreeSet<_> = all
-        .err_into()
-        .try_filter_map(|path| match path {
+        .map(|r| r.inject())
+        .try_filter_map(|path: Option<String>| match path {
             Some(path) => ready(Ref::from_path(path.as_str()).map(Some)),
             None => ready(Ok(None)),
         })
@@ -273,7 +266,7 @@ pub async fn list_refs(
         .iter()
         .filter_map(|r| match r {
             Ref::Tag(name) => Some(async {
-                (name.clone(), fetch_tag(storage, storage_settings, name.as_str()).await)
+                (name.clone(), fetch_tag(storage, ctx, name.as_str()).await)
             }),
             Ref::Branch(_) => None,
         })
@@ -288,14 +281,15 @@ pub async fn list_refs(
     Ok(candidate_refs.difference(&deleted_tags).cloned().collect())
 }
 
-#[instrument(skip(storage, storage_settings))]
+#[instrument(skip(storage, ctx))]
 pub async fn list_deleted_tags(
     storage: &(dyn Storage + Send + Sync),
-    storage_settings: &storage::Settings,
+    ctx: &StorageContext<'_>,
 ) -> RefResult<BTreeSet<String>> {
     storage
-        .list_objects(storage_settings, V1_REFS_FILE_PATH)
-        .await?
+        .list_objects(ctx, V1_REFS_FILE_PATH)
+        .await
+        .inject()?
         .try_filter_map(|li| {
             ready(if li.id.ends_with("ref.json.deleted") {
                 Ok(Some(li.id))
@@ -305,14 +299,14 @@ pub async fn list_deleted_tags(
         })
         .try_collect()
         .await
-        .map_err(|e| e.into())
+        .inject()
 }
 
 pub async fn list_tags(
     storage: &(dyn Storage + Send + Sync),
-    storage_settings: &storage::Settings,
+    ctx: &StorageContext<'_>,
 ) -> RefResult<BTreeSet<String>> {
-    let tags = list_refs(storage, storage_settings)
+    let tags = list_refs(storage, ctx)
         .await?
         .into_iter()
         .filter_map(|r| match r {
@@ -326,9 +320,9 @@ pub async fn list_tags(
 
 pub async fn list_branches(
     storage: &(dyn Storage + Send + Sync),
-    storage_settings: &storage::Settings,
+    ctx: &StorageContext<'_>,
 ) -> RefResult<BTreeSet<String>> {
-    let branches = list_refs(storage, storage_settings)
+    let branches = list_refs(storage, ctx)
         .await?
         .into_iter()
         .filter_map(|r| match r {
@@ -340,41 +334,38 @@ pub async fn list_branches(
     Ok(branches)
 }
 
-#[instrument(skip(storage, storage_settings))]
+#[instrument(skip(storage, ctx))]
 pub async fn delete_branch(
     storage: &(dyn Storage + Send + Sync),
-    storage_settings: &storage::Settings,
+    ctx: &StorageContext<'_>,
     branch: &str,
 ) -> RefResult<()> {
     // we make sure the branch exists
-    _ = fetch_branch_tip(storage, storage_settings, branch).await?;
+    _ = fetch_branch_tip_v1(storage, ctx, branch).await?;
 
     let key = branch_key(branch)?;
     storage
-        .delete_objects(
-            storage_settings,
-            V1_REFS_FILE_PATH,
-            futures::stream::iter([(key, 0)]).boxed(),
-        )
-        .await?;
+        .delete_objects(ctx, V1_REFS_FILE_PATH, futures::stream::iter([(key, 0)]).boxed())
+        .await
+        .inject()?;
     Ok(())
 }
 
-#[instrument(skip(storage, storage_settings))]
+#[instrument(skip(storage, ctx))]
 pub async fn delete_tag(
     storage: &(dyn Storage + Send + Sync),
-    storage_settings: &storage::Settings,
+    ctx: &StorageContext<'_>,
     tag: &str,
 ) -> RefResult<()> {
     // we make sure the tag exists
-    _ = fetch_tag(storage, storage_settings, tag).await?;
+    _ = fetch_tag(storage, ctx, tag).await?;
 
     // no race condition: delete_tag ^ 2 = delete_tag
     let key = tag_delete_marker_key(tag)?;
     let path = format!("{V1_REFS_FILE_PATH}/{key}");
     match storage
         .put_object(
-            storage_settings,
+            ctx,
             path.as_str(),
             Bytes::new(),
             None,
@@ -385,10 +376,10 @@ pub async fn delete_tag(
     {
         Ok(VersionedUpdateResult::Updated { .. }) => Ok(()),
         Ok(VersionedUpdateResult::NotOnLatestVersion) => {
-            Err(RefErrorKind::RefNotFound(tag.to_string()).into())
+            Err(RefError::capture(RefErrorKind::RefNotFound(tag.to_string())))
         }
 
-        Err(err) => Err(err.into()),
+        Err(err) => Err(err.inject()),
     }
 }
 
@@ -396,14 +387,14 @@ async fn async_read_to_bytes(
     mut read: Pin<Box<dyn AsyncRead + Send>>,
 ) -> RefResult<Bytes> {
     let mut data = Vec::with_capacity(1_024);
-    read.read_to_end(&mut data).await?;
+    read.read_to_end(&mut data).await.capture()?;
     Ok(Bytes::from_owner(data))
 }
 
-#[instrument(skip(storage, storage_settings))]
+#[instrument(skip(storage, ctx))]
 pub async fn fetch_tag(
     storage: &(dyn Storage + Send + Sync),
-    storage_settings: &storage::Settings,
+    ctx: &StorageContext<'_>,
     name: &str,
 ) -> RefResult<RefData> {
     let ref_path = tag_key(name)?;
@@ -411,78 +402,78 @@ pub async fn fetch_tag(
 
     let fut1 = async move {
         let path = format!("{V1_REFS_FILE_PATH}/{ref_path}");
-        match storage.get_object(storage_settings, path.as_str(), None).await {
+        match storage.get_object(ctx, path.as_str(), None).await {
             Ok((result, ..)) => Ok(async_read_to_bytes(result).await?),
             Err(StorageError { kind: StorageErrorKind::ObjectNotFound, .. }) => {
-                Err(RefErrorKind::RefNotFound(name.to_string()).into())
+                Err(RefError::capture(RefErrorKind::RefNotFound(name.to_string())))
             }
-            Err(err) => Err(err.into()),
+            Err(err) => Err(err.inject()),
         }
     }
     .boxed();
     let fut2 = async move {
         let path = format!("{V1_REFS_FILE_PATH}/{delete_marker_path}");
-        match storage.get_object(storage_settings, path.as_str(), None).await {
+        match storage.get_object(ctx, path.as_str(), None).await {
             Ok(_) => Ok(Bytes::new()),
             Err(StorageError { kind: StorageErrorKind::ObjectNotFound, .. }) => {
-                Err(RefErrorKind::RefNotFound(name.to_string()).into())
+                Err(RefError::capture(RefErrorKind::RefNotFound(name.to_string())))
             }
-            Err(err) => Err(err.into()),
+            Err(err) => Err(err.inject()),
         }
     }
     .boxed();
 
     if let Some((content, is_deleted)) = FuturesOrdered::from_iter([fut1, fut2])
-        .collect::<Vec<_>>()
+        .collect::<Vec<RefResult<Bytes>>>()
         .await
         .into_iter()
         .next_tuple()
     {
         match is_deleted {
-            Ok(_) => Err(RefErrorKind::RefNotFound(name.to_string()).into()),
+            Ok(_) => Err(RefError::capture(RefErrorKind::RefNotFound(name.to_string()))),
             Err(RefError { kind: RefErrorKind::RefNotFound(_), .. }) => {
-                let data = serde_json::from_slice(content?.as_ref())?;
+                let data = serde_json::from_slice(content?.as_ref()).capture()?;
                 Ok(data)
             }
             Err(err) => Err(err),
         }
     } else {
-        Err(RefErrorKind::RefNotFound(name.to_string()).into())
+        Err(RefError::capture(RefErrorKind::RefNotFound(name.to_string())))
     }
 }
 
-#[instrument(skip(storage, storage_settings))]
+#[instrument(skip(storage, ctx))]
 async fn fetch_branch(
     storage: &(dyn Storage + Send + Sync),
-    storage_settings: &storage::Settings,
+    ctx: &StorageContext<'_>,
     name: &str,
 ) -> RefResult<(RefData, VersionInfo)> {
     let ref_key = branch_key(name)?;
     let path = format!("{V1_REFS_FILE_PATH}/{ref_key}");
-    match storage.get_object(storage_settings, path.as_str(), None).await {
+    match storage.get_object(ctx, path.as_str(), None).await {
         Ok((result, version)) => {
             let bytes = async_read_to_bytes(result).await?;
-            let data = serde_json::from_slice(bytes.as_ref())?;
+            let data = serde_json::from_slice(bytes.as_ref()).capture()?;
             Ok((data, version))
         }
         Err(StorageError { kind: StorageErrorKind::ObjectNotFound, .. }) => {
-            Err(RefErrorKind::RefNotFound(name.to_string()).into())
+            Err(RefError::capture(RefErrorKind::RefNotFound(name.to_string())))
         }
-        Err(err) => Err(err.into()),
+        Err(err) => Err(err.inject()),
     }
 }
 
-#[instrument(skip(storage, storage_settings))]
-pub async fn fetch_branch_tip(
+#[instrument(skip(storage, ctx))]
+pub async fn fetch_branch_tip_v1(
     storage: &(dyn Storage + Send + Sync),
-    storage_settings: &storage::Settings,
+    ctx: &StorageContext<'_>,
     name: &str,
 ) -> RefResult<RefData> {
-    Ok(fetch_branch(storage, storage_settings, name).await?.0)
+    Ok(fetch_branch(storage, ctx, name).await?.0)
 }
 
-#[cfg(test)]
-#[allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
+#[cfg(all(test, feature = "object-store-fs"))]
+#[expect(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use std::sync::Arc;
 
@@ -491,13 +482,40 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::{TempDir, tempdir};
 
-    use crate::storage::{new_in_memory_storage, new_local_filesystem_storage};
-
     use super::*;
+    use crate::storage::{new_in_memory_storage, new_local_filesystem_storage};
+    use crate::strategies::ref_data;
+    use icechunk_format::roundtrip_serialization_tests;
+    use proptest::prelude::*;
+
+    roundtrip_serialization_tests!(serialize_and_deserialize_ref_data - ref_data);
+
+    /// Drift guard: `icechunk-s3` cannot depend on `icechunk-format`, so its
+    /// layout-detection anchors are hardcoded literals. Assert they still match
+    /// the real format path constants and ref-key helper, so a future rename of
+    /// those constants cannot silently break S3 legacy-layout detection.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn s3_layout_anchors_match_format_constants() {
+        use icechunk_format::REPO_INFO_FILE_PATH;
+        let anchors = icechunk_s3::DEFAULT_LAYOUT_ANCHORS;
+        // V2 anchor: the repo-info file.
+        assert!(
+            anchors.contains(&REPO_INFO_FILE_PATH),
+            "{anchors:?} missing REPO_INFO_FILE_PATH {REPO_INFO_FILE_PATH:?}"
+        );
+        // V1 anchor: the default-branch ref, built from the real (private) helper.
+        let v1_default_branch_ref =
+            format!("{V1_REFS_FILE_PATH}/{}", branch_key(Ref::DEFAULT_BRANCH).unwrap());
+        assert!(
+            anchors.contains(&v1_default_branch_ref.as_str()),
+            "{anchors:?} missing V1 default-branch ref {v1_default_branch_ref:?}"
+        );
+    }
 
     /// Execute the passed block with all test implementations of Storage.
     ///
-    /// Currently this function executes against the in-memory and local filesystem object_store
+    /// Currently this function executes against the in-memory and local filesystem `object_store`
     /// implementations.
     async fn with_test_storages<
         R,
@@ -524,59 +542,60 @@ mod tests {
     async fn test_refs() -> Result<(), Box<dyn std::error::Error>> {
         let ((_,res1),(_,res2,_)) = with_test_storages::<Result<(), Box<dyn std::error::Error>>, _, _>(|storage|  async move {
             let storage_settings =storage.default_settings().await?;
+            let ctx = StorageContext::unattributed(&storage_settings);
             let s1 = SnapshotId::random();
             let s2 = SnapshotId::random();
 
-            let res = fetch_tag(storage.as_ref(), &storage_settings, "tag1").await;
+            let res = fetch_tag(storage.as_ref(), &ctx, "tag1").await;
             assert!(matches!(res, Err(RefError{kind: RefErrorKind::RefNotFound(name),..}) if name == "tag1"));
-            assert_eq!(list_refs(storage.as_ref(), &storage_settings).await?, BTreeSet::new());
+            assert_eq!(list_refs(storage.as_ref(), &ctx).await?, BTreeSet::new());
 
-            create_tag(storage.as_ref(), &storage_settings, "tag1", s1.clone()).await?;
-            create_tag(storage.as_ref(), &storage_settings, "tag2", s2.clone()).await?;
+            create_tag(storage.as_ref(), &ctx, "tag1", s1.clone()).await?;
+            create_tag(storage.as_ref(), &ctx, "tag2", s2.clone()).await?;
 
-            let res = fetch_tag(storage.as_ref(), &storage_settings, "tag1").await?;
+            let res = fetch_tag(storage.as_ref(), &ctx, "tag1").await?;
             assert_eq!(res.snapshot, s1);
 
-            let res = fetch_tag(storage.as_ref(), &storage_settings, "tag2").await?;
+            let res = fetch_tag(storage.as_ref(), &ctx, "tag2").await?;
             assert_eq!(res.snapshot, s2);
 
             assert_eq!(
-                list_refs(storage.as_ref(), &storage_settings).await?,
+                list_refs(storage.as_ref(), &ctx).await?,
                 BTreeSet::from([Ref::Tag("tag1".to_string()), Ref::Tag("tag2".to_string())])
             );
 
             // attempts to recreate a tag fail
             assert!(matches!(
-                create_tag(storage.as_ref(), &storage_settings, "tag1", s1.clone()).await,
+                create_tag(storage.as_ref(), &ctx, "tag1", s1.clone()).await,
                     Err(RefError{kind: RefErrorKind::TagAlreadyExists(name), ..}) if name == "tag1"
             ));
             assert_eq!(
-                list_refs(storage.as_ref(), &storage_settings).await?,
+                list_refs(storage.as_ref(), &ctx).await?,
                 BTreeSet::from([Ref::Tag("tag1".to_string()), Ref::Tag("tag2".to_string())])
             );
 
             // attempting to create a branch that doesn't exist, with a fake parent
             let res =
-                update_branch(storage.as_ref(), &storage_settings, "branch0", s1.clone(), Some(&s2))
+                update_branch(storage.as_ref(), &ctx, "branch0", s1.clone(), Some(&s2))
                     .await;
             assert!(res.is_err());
             assert_eq!(
-                list_refs(storage.as_ref(), &storage_settings).await?,
+                list_refs(storage.as_ref(), &ctx).await?,
                 BTreeSet::from([Ref::Tag("tag1".to_string()), Ref::Tag("tag2".to_string())])
             );
 
             // create a branch successfully
-            update_branch(storage.as_ref(), &storage_settings, "branch1", s1.clone(), None).await?;
+            update_branch(storage.as_ref(), &ctx, "branch1", s1.clone(), None).await?;
 
 
             assert_eq!(
-                fetch_branch_tip(storage.as_ref(), &storage_settings, "branch1").await?,
+                fetch_branch_tip_v1(storage.as_ref(), &ctx, "branch1").await?,
                 RefData { snapshot: s1.clone() }
             );
 
 
             assert_eq!(
-                list_refs(storage.as_ref(), &storage_settings).await?,
+                list_refs(storage.as_ref(), &ctx).await?,
                 BTreeSet::from([
                     Ref::Branch("branch1".to_string()),
             Ref::Tag("tag1".to_string()),
@@ -586,7 +605,7 @@ mod tests {
 
             // update a branch successfully
             update_branch(
-                storage.as_ref(), &storage_settings,
+                storage.as_ref(), &ctx,
                 "branch1",
                 s2.clone(),
                 Some(&s1.clone()),
@@ -594,14 +613,14 @@ mod tests {
             .await?;
 
             assert_eq!(
-                fetch_branch_tip(storage.as_ref(), &storage_settings, "branch1").await?,
+                fetch_branch_tip_v1(storage.as_ref(), &ctx, "branch1").await?,
                 RefData { snapshot: s2.clone() }
             );
 
             let sid = SnapshotId::random();
             // update a branch with the wrong parent
             let res =
-                update_branch(storage.as_ref(), &storage_settings, "branch1", sid.clone(), Some(&s1))
+                update_branch(storage.as_ref(), &ctx, "branch1", sid.clone(), Some(&s1))
                     .await;
             assert!(matches!(res,
                     Err(RefError{kind: RefErrorKind::Conflict { expected_parent, actual_parent }, ..})
@@ -609,19 +628,19 @@ mod tests {
             ));
 
             // update the branch again but now with the right parent
-            update_branch(storage.as_ref(), &storage_settings, "branch1", sid.clone(), Some(&s2))
+            update_branch(storage.as_ref(), &ctx, "branch1", sid.clone(), Some(&s2))
                 .await?;
 
             assert_eq!(
-                fetch_branch_tip(storage.as_ref(), &storage_settings, "branch1").await?,
+                fetch_branch_tip_v1(storage.as_ref(), &ctx, "branch1").await?,
                 RefData { snapshot: sid.clone() }
             );
 
 
             // delete a branch
-            delete_branch(storage.as_ref(), &storage_settings, "branch1").await?;
+            delete_branch(storage.as_ref(), &ctx, "branch1").await?;
             assert!(matches!(
-                fetch_branch_tip(storage.as_ref(), &storage_settings, "branch1").await,
+                fetch_branch_tip_v1(storage.as_ref(), &ctx, "branch1").await,
                 Err(RefError{kind: RefErrorKind::RefNotFound(name),..}) if name == "branch1"
             ));
 
@@ -640,44 +659,39 @@ mod tests {
             _,
         >(|storage| async move {
             let storage_settings = storage.default_settings().await?;
+            let ctx = StorageContext::unattributed(&storage_settings);
             let s1 = SnapshotId::random();
             let s2 = SnapshotId::random();
-            create_tag(storage.as_ref(), &storage_settings, "tag1", s1).await?;
+            create_tag(storage.as_ref(), &ctx, "tag1", s1).await?;
 
             // we can delete tags
-            delete_tag(storage.as_ref(), &storage_settings, "tag1").await?;
+            delete_tag(storage.as_ref(), &ctx, "tag1").await?;
 
             // cannot delete twice
-            assert!(delete_tag(storage.as_ref(), &storage_settings, "tag1")
-                .await
-                .is_err());
+            assert!(delete_tag(storage.as_ref(), &ctx, "tag1").await.is_err());
 
             // we cannot delete non-existent tag
-            assert!(delete_tag(
-                storage.as_ref(),
-                &storage_settings,
-                "doesnt_exist",
-            )
-            .await
-            .is_err());
+            assert!(
+                delete_tag(storage.as_ref(), &ctx, "doesnt_exist",).await.is_err()
+            );
 
             // cannot recreate same tag
             matches!(create_tag(
                 storage.as_ref(),
-                &storage_settings,
+                &ctx,
                 "tag1",
                 s2.clone(),
             )
             .await, Err(RefError{kind: RefErrorKind::TagAlreadyExists(name),..}) if name == "tag1");
 
-            assert!(list_tags(storage.as_ref(), &storage_settings).await?.is_empty());
+            assert!(list_tags(storage.as_ref(), &ctx).await?.is_empty());
 
             // can create different tag
-            create_tag(storage.as_ref(), &storage_settings, "tag2", s2).await?;
+            create_tag(storage.as_ref(), &ctx, "tag2", s2).await?;
 
             // listing doesn't include deleted tags
             assert_eq!(
-                list_tags(storage.as_ref(), &storage_settings).await?,
+                list_tags(storage.as_ref(), &ctx).await?,
                 ["tag2".to_string()].into(),
             );
 

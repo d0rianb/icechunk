@@ -1,6 +1,7 @@
 import functools
+import sys
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, Any, ParamSpec, TypeAlias, TypeVar
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from packaging.version import Version
@@ -19,16 +20,13 @@ if TYPE_CHECKING:
     except ImportError:
         ArrayV3Metadata = Any  # type: ignore[misc,assignment]
 
-SimpleGraph: TypeAlias = Mapping[tuple[str, int], tuple[Any, ...]]
+type SimpleGraph = Mapping[tuple[str, int], tuple[Any, ...]]
 
 
 # We wrap `extract_session` and `merge_sessions` to explicitly handle the `meta` computation.
 
-P = ParamSpec("P")
-R = TypeVar("R")
 
-
-def computing_meta(func: Callable[P, R]) -> Callable[P, Any]:
+def computing_meta[**P, R](func: Callable[P, R]) -> Callable[P, Any]:
     """
     A decorator to handle the dask-specific `computing_meta` flag.
 
@@ -54,9 +52,9 @@ def merge_sessions_array_kwargs(
 
 def _assert_correct_dask_version() -> None:
     dask_version = dask.__version__  # type: ignore[attr-defined]
-    if Version(dask_version) < Version("2024.11.0"):
+    if Version(dask_version) < Version("2025.2.0"):
         raise ValueError(
-            f"Writing to icechunk requires dask>=2024.11.0 but you have {dask_version}. Please upgrade."
+            f"Writing to icechunk requires dask>=2025.2.0 but you have {dask_version}. Please upgrade."
         )
 
 
@@ -75,9 +73,8 @@ def store_dask(
     merge the changesets corresponding to each write task. The `store` object
     passed in will be updated in-place with the fully merged changeset.
 
-    For distributed or multi-processing writes, this method must be called within
-    the `Session.allow_pickling()` context. All Zarr arrays in `targets` must also
-    be created within this context since they contain a reference to the Session.
+    For distributed or multi-processing writes, use `Session.fork()` to create a
+    `ForkSession` that can be pickled and distributed to remote workers.
 
     Parameters
     ----------
@@ -107,16 +104,26 @@ def store_dask(
     return session_merge_reduction(stored_arrays, split_every=split_every, **store_kwargs)
 
 
+def _reduction_for(arr: Any) -> Any:
+    # dask-array's Array isn't a da.Array; stock da.reduction re-wraps it via from_array.
+    if isinstance(arr, da.Array):
+        return da.reduction
+    dask_array = sys.modules.get("dask_array")
+    if dask_array is not None and isinstance(arr, dask_array.Array):
+        return dask_array.reduction
+    raise TypeError(f"Expected a dask array, received {type(arr)!r}")
+
+
 def session_merge_reduction(
     arrays: Array | list[Array], *, split_every: int | None, **store_kwargs: Any
 ) -> ForkSession:
-    if isinstance(arrays, da.Array):
+    if not isinstance(arrays, (list, tuple)):
         arrays = [arrays]
     # Now we tree-reduce all changesets
     # reduce the individual arrays since concatenation isn't always trivial due
     # to different shapes
     merged_sessions = [
-        da.reduction(  # type: ignore[no-untyped-call]
+        _reduction_for(arr)(
             arr,
             name="ice-changeset",
             chunk=computing_meta(extract_session),

@@ -1,21 +1,32 @@
+// PyO3 extracts Python objects into owned Rust types (String, Vec<u8>, etc.),
+// so #[pymethods] signatures inherently take arguments by value.
+#![allow(clippy::needless_pass_by_value)]
+
 mod config;
 mod conflicts;
+mod display;
 mod errors;
 mod pickle;
+mod python_logs;
 mod repository;
 mod session;
+mod stats;
 mod store;
 mod streams;
+mod virtualrefs;
 
 use std::env;
 
 use config::{
-    PyAzureCredentials, PyAzureStaticCredentials, PyCachingConfig,
+    PyAttribution, PyAzureCredentials, PyAzureRefreshableCredential,
+    PyAzureStaticCredentials, PyCachingConfig, PyChecksumAlgorithm,
     PyCompressionAlgorithm, PyCompressionConfig, PyCredentials, PyGcsBearerCredential,
-    PyGcsCredentials, PyGcsStaticCredentials, PyManifestConfig,
-    PyManifestPreloadCondition, PyManifestPreloadConfig, PyObjectStoreConfig,
-    PyRepositoryConfig, PyS3Credentials, PyS3Options, PyS3StaticCredentials, PyStorage,
-    PyStorageConcurrencySettings, PyStorageRetriesSettings, PyStorageSettings,
+    PyGcsCredentials, PyGcsStaticCredentials, PyLatencyStorage, PyManifestConfig,
+    PyManifestPreloadCondition, PyManifestPreloadConfig,
+    PyManifestVirtualChunkLocationCompressionConfig, PyObjectStoreConfig,
+    PyRepoUpdateRetryConfig, PyRepositoryConfig, PyS3Credentials, PyS3Options,
+    PyS3StaticCredentials, PyStorage, PyStorageConcurrencySettings, PyStorageObjectInfo,
+    PyStorageRetriesSettings, PyStorageSettings, PyStorageTimeoutSettings,
     PyVirtualChunkContainer,
 };
 use config::{
@@ -25,33 +36,32 @@ use conflicts::{
     PyBasicConflictSolver, PyConflict, PyConflictDetector, PyConflictSolver,
     PyConflictType, PyVersionSelection,
 };
-use errors::{IcechunkError, PyConflictError, PyRebaseFailedError};
-use icechunk::{format::format_constants::SpecVersionBin, initialize_tracing};
+use display::PyAncestryGraph;
+use errors::{_all_error_kinds, IcechunkError, PyConflictError, PyRebaseFailedError};
+use icechunk::format::format_constants::SpecVersionBin;
 use pyo3::prelude::*;
 use pyo3::types::PyMapping;
 use pyo3::wrap_pyfunction;
 use repository::{
-    PyBranchCreatedUpdate, PyBranchDeletedUpdate, PyBranchResetUpdate,
-    PyCommitAmendedUpdate, PyConfigChangedUpdate, PyDiff, PyExpirationRanUpdate,
-    PyGCRanUpdate, PyGCSummary, PyManifestFileInfo, PyMetadataChangedUpdate,
-    PyNewCommitUpdate, PyNewDetachedSnapshotUpdate, PyRepoInitializedUpdate,
-    PyRepoMigratedUpdate, PyRepository, PySnapshotInfo, PyTagCreatedUpdate,
-    PyTagDeletedUpdate, PyUpdateType,
+    PyDiff, PyFeatureFlag, PyGCSummary, PyManifestFileInfo, PyRepoAvailability,
+    PyRepoStatus, PyRepository, PySnapshotInfo, PySpecVersion, PyUpdate, PyUpdateType,
 };
-use session::PySession;
+use session::{ChunkType, PySession, PySessionMode};
+use stats::PyChunkStorageStats;
 use store::{PyStore, VirtualChunkSpec};
 
 #[cfg(feature = "cli")]
-use clap::Parser;
+use clap::Parser as _;
 #[cfg(feature = "cli")]
 use icechunk::cli::interface::{IcechunkCLI, run_cli};
 
 #[cfg(feature = "cli")]
 #[pyfunction]
-fn cli_entrypoint(py: Python) -> PyResult<()> {
+#[expect(clippy::exit)] // CLI entrypoint must exit the process on error
+fn cli_entrypoint(py: Python<'_>) -> PyResult<()> {
     let sys = py.import("sys")?;
     let args: Vec<String> = sys.getattr("argv")?.extract()?;
-    match IcechunkCLI::try_parse_from(args.to_vec()) {
+    match IcechunkCLI::try_parse_from(args.clone()) {
         Ok(cli_args) => pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
             if let Err(e) = run_cli(cli_args).await {
                 eprintln!("{e}");
@@ -73,25 +83,47 @@ fn cli_entrypoint(py: Python) -> PyResult<()> {
 
 #[cfg(not(feature = "cli"))]
 #[pyfunction]
-fn cli_entrypoint(_py: Python) -> PyResult<()> {
+fn cli_entrypoint(_py: Python<'_>) -> PyResult<()> {
     println!("Must install the optional `cli` feature to use the Icechunk CLI.");
     Ok(())
 }
 
-fn log_filters_from_env(py: Python) -> PyResult<Option<String>> {
+fn log_filters_from_env(py: Python<'_>) -> PyResult<Option<String>> {
     let os = py.import("os")?;
     let environ = os.getattr("environ")?;
-    let environ: &Bound<PyMapping> = environ.cast()?;
+    let environ: &Bound<'_, PyMapping> = environ.cast()?;
     let value = environ.get_item("ICECHUNK_LOG").ok().and_then(|v| v.extract().ok());
     Ok(value)
 }
 
 #[pyfunction]
-fn initialize_logs(py: Python) -> PyResult<()> {
+fn initialize_logs(py: Python<'_>) -> PyResult<()> {
     if env::var("ICECHUNK_NO_LOGS").is_err() {
         let log_filter_directive = log_filters_from_env(py)?;
-        initialize_tracing(log_filter_directive.as_deref())
+        // The OTLP exporter must be built inside a Tokio runtime
+        // Bind it to Icechunk's long-lived global runtime so it lives for the life of the process
+        // and can flush the last spans on shutdown
+        let _rt_guard = pyo3_async_runtimes::tokio::get_runtime().enter();
+        let destination = env::var("ICECHUNK_LOG_DESTINATION").ok();
+        python_logs::initialize(py, log_filter_directive, destination.as_deref())?;
+
+        // The final span batch must be flushed before process shutdown
+        register_telemetry_shutdown(py)?;
     }
+    Ok(())
+}
+
+/// Flush and shut down OpenTelemetry trace export. A no-op unless the library
+/// was built with the `otel` feature and an OTLP endpoint was configured.
+#[pyfunction]
+fn shutdown_telemetry() {
+    icechunk::shutdown_telemetry();
+}
+
+fn register_telemetry_shutdown(py: Python<'_>) -> PyResult<()> {
+    let atexit = py.import("atexit")?;
+    let shutdown = wrap_pyfunction!(shutdown_telemetry, py)?;
+    atexit.call_method1("register", (shutdown,))?;
     Ok(())
 }
 
@@ -122,7 +154,7 @@ fn check_filter_for_misspellings(filter: &str) {
 }
 
 #[pyfunction]
-fn set_logs_filter(py: Python, log_filter_directive: Option<String>) -> PyResult<()> {
+fn set_logs_filter(py: Python<'_>, log_filter_directive: Option<String>) -> PyResult<()> {
     let log_filter_directive =
         log_filter_directive.or_else(|| log_filters_from_env(py).ok().flatten());
 
@@ -130,26 +162,33 @@ fn set_logs_filter(py: Python, log_filter_directive: Option<String>) -> PyResult
         check_filter_for_misspellings(filter);
     }
 
-    initialize_tracing(log_filter_directive.as_deref());
+    python_logs::set_filter(log_filter_directive);
     Ok(())
 }
 
 #[pyfunction]
 /// The spec version that this version of the Icechunk library
 /// uses to write metadata files
-fn spec_version() -> u8 {
-    SpecVersionBin::current() as u8
+fn spec_version() -> PySpecVersion {
+    SpecVersionBin::current().into()
 }
 
 #[pyfunction]
-#[pyo3(signature = (repo, *, dry_run = true, delete_unused_v1_files = true))]
+/// The user-agent string sent with icechunk storage requests
+fn user_agent() -> &'static str {
+    icechunk::user_agent()
+}
+
+#[pyfunction]
+#[pyo3(signature = (repo, *, dry_run = true, delete_unused_v1_files = true, prefetch_concurrency = None))]
 fn _upgrade_icechunk_repository(
-    py: Python,
+    py: Python<'_>,
     repo: &PyRepository,
     dry_run: bool,
     delete_unused_v1_files: bool,
-) -> PyResult<()> {
-    repo.migrate_1_to_2(py, dry_run, delete_unused_v1_files)
+    prefetch_concurrency: Option<usize>,
+) -> PyResult<PyRepository> {
+    repo.migrate_1_to_2(py, dry_run, delete_unused_v1_files, prefetch_concurrency)
 }
 
 fn pep440_version() -> String {
@@ -164,9 +203,14 @@ fn _icechunk_python(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRepository>()?;
     m.add_class::<PyRepositoryConfig>()?;
     m.add_class::<PySession>()?;
+    m.add_class::<ChunkType>()?;
+    m.add_class::<PySessionMode>()?;
     m.add_class::<PyStore>()?;
+    m.add_class::<streams::PyAsyncCloseableIterator>()?;
     m.add_class::<PySnapshotInfo>()?;
+    m.add_class::<PyAncestryGraph>()?;
     m.add_class::<PyManifestFileInfo>()?;
+    m.add_class::<PyChunkStorageStats>()?;
     m.add_class::<PyConflictSolver>()?;
     m.add_class::<PyBasicConflictSolver>()?;
     m.add_class::<PyConflictDetector>()?;
@@ -176,46 +220,49 @@ fn _icechunk_python(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGcsCredentials>()?;
     m.add_class::<PyGcsBearerCredential>()?;
     m.add_class::<PyGcsStaticCredentials>()?;
+    m.add_class::<PyAzureRefreshableCredential>()?;
     m.add_class::<PyAzureCredentials>()?;
     m.add_class::<PyAzureStaticCredentials>()?;
     m.add_class::<PyCredentials>()?;
     m.add_class::<PyS3Options>()?;
+    m.add_class::<PyChecksumAlgorithm>()?;
     m.add_class::<PyObjectStoreConfig>()?;
+    m.add_class::<PyStorageObjectInfo>()?;
     m.add_class::<PyStorage>()?;
+    m.add_class::<PyLatencyStorage>()?;
     m.add_class::<PyVirtualChunkContainer>()?;
     m.add_class::<PyCompressionAlgorithm>()?;
     m.add_class::<PyCompressionConfig>()?;
+    m.add_class::<PyAttribution>()?;
     m.add_class::<PyCachingConfig>()?;
     m.add_class::<PyStorageConcurrencySettings>()?;
     m.add_class::<PyStorageRetriesSettings>()?;
+    m.add_class::<PyStorageTimeoutSettings>()?;
+    m.add_class::<PyRepoUpdateRetryConfig>()?;
     m.add_class::<PyManifestPreloadConfig>()?;
     m.add_class::<PyManifestPreloadCondition>()?;
     m.add_class::<PyManifestConfig>()?;
+    m.add_class::<PyManifestVirtualChunkLocationCompressionConfig>()?;
     m.add_class::<PyManifestSplitDimCondition>()?;
     m.add_class::<PyManifestSplitCondition>()?;
     m.add_class::<PyManifestSplittingConfig>()?;
     m.add_class::<PyStorageSettings>()?;
     m.add_class::<PyGCSummary>()?;
     m.add_class::<PyDiff>()?;
+    m.add_class::<PyRepoAvailability>()?;
+    m.add_class::<PyRepoStatus>()?;
+    m.add_class::<PySpecVersion>()?;
     m.add_class::<PyUpdateType>()?;
-    m.add_class::<PyRepoInitializedUpdate>()?;
-    m.add_class::<PyRepoMigratedUpdate>()?;
-    m.add_class::<PyConfigChangedUpdate>()?;
-    m.add_class::<PyMetadataChangedUpdate>()?;
-    m.add_class::<PyTagCreatedUpdate>()?;
-    m.add_class::<PyTagDeletedUpdate>()?;
-    m.add_class::<PyBranchCreatedUpdate>()?;
-    m.add_class::<PyBranchDeletedUpdate>()?;
-    m.add_class::<PyBranchResetUpdate>()?;
-    m.add_class::<PyNewCommitUpdate>()?;
-    m.add_class::<PyNewDetachedSnapshotUpdate>()?;
-    m.add_class::<PyCommitAmendedUpdate>()?;
-    m.add_class::<PyGCRanUpdate>()?;
-    m.add_class::<PyExpirationRanUpdate>()?;
+    m.add_class::<PyUpdate>()?;
+    m.add_class::<PyFeatureFlag>()?;
     m.add_class::<VirtualChunkSpec>()?;
     m.add_function(wrap_pyfunction!(initialize_logs, m)?)?;
     m.add_function(wrap_pyfunction!(set_logs_filter, m)?)?;
+    m.add_function(wrap_pyfunction!(python_logs::set_logs_destination, m)?)?;
+    m.add_function(wrap_pyfunction!(python_logs::flush_python_logs, m)?)?;
+    m.add_function(wrap_pyfunction!(shutdown_telemetry, m)?)?;
     m.add_function(wrap_pyfunction!(spec_version, m)?)?;
+    m.add_function(wrap_pyfunction!(user_agent, m)?)?;
     m.add_function(wrap_pyfunction!(cli_entrypoint, m)?)?;
     m.add_function(wrap_pyfunction!(_upgrade_icechunk_repository, m)?)?;
     m.add("__version__", pep440_version())?;
@@ -224,6 +271,7 @@ fn _icechunk_python(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("IcechunkError", py.get_type::<IcechunkError>())?;
     m.add("ConflictError", py.get_type::<PyConflictError>())?;
     m.add("RebaseFailedError", py.get_type::<PyRebaseFailedError>())?;
+    m.add_function(wrap_pyfunction!(_all_error_kinds, m)?)?;
     m.add_class::<PyConflictType>()?;
     m.add_class::<PyConflict>()?;
 

@@ -3,6 +3,7 @@ name: Dependency Check
 on:
   pull_request:
     types: [opened, reopened, synchronize]
+  merge_group:
   push:
     branches:
       - main
@@ -12,7 +13,8 @@ on:
     - cron: '0 0 * * 0'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # event_name keeps a push to main from cancelling the running weekly check
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
@@ -21,8 +23,10 @@ env:
   CI: 1
   RUST_BACKTRACE: short
   RUSTUP_MAX_RETRIES: 10
-  RUST_CHANNEL: '1.91.0'
-  CARGO_DENY_VERSION: '0.18.4'
+  PIXI_VERSION: "v0.82.1"
+
+permissions:
+  contents: read
 
 jobs:
   check-dependencies:
@@ -32,28 +36,17 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
-      - name: Install Rust toolchain
-        run: |
-          rustup update --no-self-update ${{ env.RUST_CHANNEL }}
-          rustup default ${{ env.RUST_CHANNEL }}
-
-      - name: Cache cargo-deny
-        uses: actions/cache@v4
-        id: cargo_deny_cache
+      - uses: prefix-dev/setup-pixi@9dabb60412d3d2d967a8d682f7ce01317af40514 # v0.11.0
         with:
-          path: ~/.cargo/bin/cargo-deny
-          key: cargo-deny-${{ env.CARGO_DENY_VERSION }}-${{ runner.os }}
-
-      - name: Install cargo-deny
-        if: steps.cargo_deny_cache.outputs.cache-hit != 'true'
-        run: cargo install --locked cargo-deny --version ${{ env.CARGO_DENY_VERSION }}
-
-      - name: Install Just
-        run: sudo snap install --edge --classic just
+          pixi-version: ${{ env.PIXI_VERSION }}
+          cache: false
+          activate-environment: true
+          manifest-path: icechunk-python/pyproject.toml
 
       - name: Run dependency checks
         run: |

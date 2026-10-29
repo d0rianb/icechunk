@@ -66,7 +66,7 @@ def test_detect_conflicts(repo: icechunk.Repository) -> None:
             assert e.conflicts[2].conflicted_chunks
             assert len(e.conflicts[2].conflicted_chunks) == 100
 
-            raise e
+            raise
 
 
 def test_rebase_no_conflicts(repo: icechunk.Repository) -> None:
@@ -92,6 +92,9 @@ def test_rebase_no_conflicts(repo: icechunk.Repository) -> None:
     array_c = cast("zarr.Array[Any]", root_c["foo/bar/some-array"])
     np.testing.assert_array_equal(array_c[:], 1)
     assert array_c.attrs["repo"] == 2
+
+    info = next(iter(repo.ancestry(branch="main")))
+    assert info.metadata["__icechunk"] == {"rebase_attempts": 1}
 
 
 def test_rebase_fails_on_user_atts_double_edit(repo: icechunk.Repository) -> None:
@@ -173,7 +176,7 @@ def test_rebase_chunks_with_ours(
                 ),
             )
 
-            raise e
+            raise
 
     solver = icechunk.BasicConflictSolver(
         on_chunk_conflict=on_chunk_conflict,
@@ -241,7 +244,7 @@ async def test_rebase_async(any_spec_version: int | None) -> None:
             assert e.conflicts[0].conflict_type == icechunk.ConflictType.ChunkDoubleUpdate
             assert e.conflicts[0].conflicted_chunks
             assert len(e.conflicts[0].conflicted_chunks) == 100
-            raise e
+            raise
 
     # Test successful rebase_async with BasicConflictSolver
     solver = icechunk.BasicConflictSolver(
@@ -260,3 +263,26 @@ async def test_rebase_async(any_spec_version: int | None) -> None:
     # Should have session_b's values due to UseOurs selection
     assert array_final[0, 0] == 2
     assert array_final.attrs["repo"] == 1
+
+
+def test_conflict_repr_and_str() -> None:
+    """Test that Conflict types have correct string representations."""
+    conflict = icechunk.Conflict(
+        icechunk.ConflictType.ChunkDoubleUpdate,
+        "/my/array",
+        [[0, 0]],
+    )
+
+    # Test __repr__
+    repr_str = repr(conflict)
+    assert "ChunkDoubleUpdate" in repr_str
+    assert "/my/array" in repr_str
+
+    # Test __str__
+    str_str = str(conflict)
+    assert "/my/array" in str_str
+
+    # Test ConflictType repr and str
+    conflict_type = icechunk.ConflictType.ZarrMetadataDoubleUpdate
+    assert "ZarrMetadataDoubleUpdate" in repr(conflict_type)
+    assert "metadata" in str(conflict_type).lower()

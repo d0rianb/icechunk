@@ -1,35 +1,55 @@
 use std::{borrow::Cow, sync::Arc};
 
+use async_stream::try_stream;
+use bytes::Bytes;
 use chrono::Utc;
-use futures::{StreamExt, TryStreamExt};
+use futures::{StreamExt as _, TryStreamExt as _};
 use icechunk::{
     Store,
     format::{
         ChunkIndices, ChunkLength, ChunkOffset, Path,
-        manifest::{Checksum, SecondsSinceEpoch, VirtualChunkLocation, VirtualChunkRef},
+        manifest::{
+            Checksum, ChunkPayload, ChunkRef, SecondsSinceEpoch, VirtualChunkLocation,
+            VirtualChunkRef,
+        },
     },
+    session::{SessionError, SessionErrorKind},
     storage::ETag,
     store::{SetVirtualRefsResult, StoreError, StoreErrorKind},
 };
 use itertools::Itertools as _;
+use numpy::{IntoPyArray as _, PyArrayMethods as _, PyReadonlyArray1};
 use pyo3::{
-    conversion::IntoPyObjectExt,
+    conversion::IntoPyObjectExt as _,
     exceptions::{PyKeyError, PyValueError},
     prelude::*,
-    types::{PyTuple, PyType},
+    types::{PyBytes as PyBytesType, PyDict, PyList, PyTuple, PyType},
 };
 use pyo3_bytes::PyBytes;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::{
+    display::{PyRepr, ReprMode, py_bool},
     errors::{PyIcechunkStoreError, PyIcechunkStoreResult},
     impl_pickle,
-    session::PySession,
-    streams::PyAsyncGenerator,
+    session::{ChunkType, PySession},
+    streams::PyAsyncCloseableIterator,
+    virtualrefs::{build_vrefs_from_arrays, do_set_virtual_refs, vrefs_result_to_py},
 };
 
 type KeyRanges = Vec<(String, (Option<ChunkOffset>, Option<ChunkOffset>))>;
+
+/// Normalize a user-supplied zarr array path string into an icechunk [`Path`].
+///
+/// Prepends a leading `/` if missing (icechunk paths are absolute), then runs
+/// the standard path validator. Used by every `PyStore` method that takes a
+/// caller-supplied array path.
+pub(crate) fn parse_array_path(path: String) -> PyResult<Path> {
+    let path = if path.starts_with('/') { path } else { format!("/{path}") };
+    Path::try_from(path)
+        .map_err(|e| PyValueError::new_err(format!("Invalid array path: {e}")))
+}
 
 #[derive(FromPyObject, Clone, Debug)]
 enum ChecksumArgument {
@@ -50,7 +70,7 @@ impl From<ChecksumArgument> for Checksum {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct VirtualChunkSpec {
     #[pyo3(get)]
@@ -97,8 +117,30 @@ impl VirtualChunkSpec {
 impl_pickle!(VirtualChunkSpec);
 
 #[pyclass(name = "PyStore")]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PyStore(pub Arc<Store>);
+
+impl PyRepr for PyStore {
+    const EXECUTABLE: bool = false;
+
+    fn cls_name() -> &'static str {
+        "icechunk.IcechunkStore"
+    }
+
+    fn fields(&self, _mode: ReprMode) -> Vec<(&str, String)> {
+        let session = self.0.session();
+        let session_guard = session.blocking_read();
+        let branch = session_guard
+            .branch()
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "None".to_string());
+        vec![
+            ("read_only", py_bool(session_guard.read_only())),
+            ("snapshot_id", session_guard.snapshot_id().to_string()),
+            ("branch", branch),
+        ]
+    }
+}
 
 #[pymethods]
 impl PyStore {
@@ -111,7 +153,7 @@ impl PyStore {
         // This is a compute intensive task, we need to release the Gil
         py.detach(move || {
             let bytes = bytes.into_inner();
-            let store = Store::from_bytes(bytes).map_err(|e| {
+            let store = Store::from_bytes(&bytes).map_err(|e| {
                 PyValueError::new_err(format!(
                     "Failed to deserialize store from bytes: {e}"
                 ))
@@ -123,6 +165,18 @@ impl PyStore {
     fn __eq__(&self, other: &PyStore) -> bool {
         // If the stores were created from the same session they are equal
         Arc::ptr_eq(&self.0.session(), &other.0.session())
+    }
+
+    pub(crate) fn __repr__(&self) -> String {
+        <Self as PyRepr>::__repr__(self)
+    }
+
+    pub(crate) fn __str__(&self) -> String {
+        <Self as PyRepr>::__str__(self)
+    }
+
+    pub(crate) fn _repr_html_(&self) -> String {
+        <Self as PyRepr>::_repr_html_(self)
     }
 
     #[getter]
@@ -139,7 +193,6 @@ impl PyStore {
     fn as_bytes(&self, py: Python<'_>) -> PyResult<Cow<'_, [u8]>> {
         // This is blocking function, we need to release the Gil
         py.detach(move || {
-            // FIXME: Use rmp_serde instead of serde_json to optimize performance
             pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
                 let serialized =
                     self.0.as_bytes().await.map_err(PyIcechunkStoreError::from)?;
@@ -304,7 +357,7 @@ impl PyStore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn set_virtual_ref(
         &self,
         py: Python<'_>,
@@ -320,9 +373,8 @@ impl PyStore {
             let store = Arc::clone(&self.0);
 
             pyo3_async_runtimes::tokio::get_runtime().block_on(async move {
-                let location =
-                    VirtualChunkLocation::from_absolute_path(location.as_str())
-                        .map_err(PyIcechunkStoreError::from)?;
+                let location = VirtualChunkLocation::from_url(location.as_str())
+                    .map_err(PyIcechunkStoreError::from)?;
                 let virtual_ref = VirtualChunkRef {
                     location,
                     offset,
@@ -338,7 +390,7 @@ impl PyStore {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn set_virtual_ref_async<'py>(
         &'py self,
         py: Python<'py>,
@@ -351,7 +403,7 @@ impl PyStore {
     ) -> PyResult<Bound<'py, PyAny>> {
         let store = Arc::clone(&self.0);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let location = VirtualChunkLocation::from_absolute_path(location.as_str())
+            let location = VirtualChunkLocation::from_url(location.as_str())
                 .map_err(PyIcechunkStoreError::from)?;
             let virtual_ref = VirtualChunkRef {
                 location,
@@ -383,10 +435,9 @@ impl PyStore {
                     .map(|vcs| {
                         let checksum = vcs.checksum();
                         let index = ChunkIndices(vcs.index);
-                        let location = VirtualChunkLocation::from_absolute_path(
-                            vcs.location.as_str(),
-                        )
-                        .map_err(PyIcechunkStoreError::from)?;
+                        let location =
+                            VirtualChunkLocation::from_url(vcs.location.as_str())
+                                .map_err(PyIcechunkStoreError::from)?;
                         let vref = VirtualChunkRef {
                             offset: vcs.offset,
                             length: vcs.length,
@@ -397,15 +448,7 @@ impl PyStore {
                     })
                     .try_collect()?;
 
-                let array_path = if !array_path.starts_with("/") {
-                    format!("/{array_path}")
-                } else {
-                    array_path.to_string()
-                };
-
-                let path = Path::try_from(array_path).map_err(|e| {
-                    PyValueError::new_err(format!("Invalid array path: {e}"))
-                })?;
+                let path = parse_array_path(array_path.clone())?;
 
                 let res = store
                     .set_virtual_refs(&path, validate_containers, vrefs)
@@ -444,10 +487,9 @@ impl PyStore {
                     .map(|vcs| {
                         let checksum = vcs.checksum();
                         let index = ChunkIndices(vcs.index);
-                        let location = VirtualChunkLocation::from_absolute_path(
-                            vcs.location.as_str(),
-                        )
-                        .map_err(PyIcechunkStoreError::from)?;
+                        let location =
+                            VirtualChunkLocation::from_url(vcs.location.as_str())
+                                .map_err(PyIcechunkStoreError::from)?;
                         let vref = VirtualChunkRef {
                             offset: vcs.offset,
                             length: vcs.length,
@@ -458,15 +500,7 @@ impl PyStore {
                     })
                     .try_collect()?;
 
-                let array_path = if !array_path.starts_with("/") {
-                    format!("/{array_path}")
-                } else {
-                    array_path.to_string()
-                };
-
-                let path = Path::try_from(array_path).map_err(|e| {
-                    PyValueError::new_err(format!("Invalid array path: {e}"))
-                })?;
+                let path = parse_array_path(array_path.clone())?;
 
                 let res = store
                     .set_virtual_refs(&path, validate_containers, vrefs)
@@ -486,6 +520,228 @@ impl PyStore {
                 }
             },
         )
+    }
+
+    /// Set virtual references from columnar data (list of locations + numpy arrays).
+    ///
+    /// More efficient than `set_virtual_refs` as it avoids creating per-chunk
+    /// Python `VirtualChunkSpec` objects.
+    #[expect(clippy::too_many_arguments)]
+    #[pyo3(signature = (array_path, chunk_grid_shape, locations, offsets, lengths, *, validate_containers = true, arr_offset = None, checksum = None))]
+    fn set_virtual_refs_arr(
+        &self,
+        py: Python<'_>,
+        array_path: String,
+        chunk_grid_shape: Vec<u32>,
+        locations: &Bound<'_, PyList>,
+        offsets: PyReadonlyArray1<'_, u64>,
+        lengths: PyReadonlyArray1<'_, u64>,
+        validate_containers: bool,
+        arr_offset: Option<Vec<u32>>,
+        checksum: Option<ChecksumArgument>,
+    ) -> PyResult<Option<Vec<Py<PyTuple>>>> {
+        let vrefs = build_vrefs_from_arrays(
+            locations,
+            offsets.as_slice().map_err(|e| {
+                PyValueError::new_err(format!("offsets array must be contiguous: {e}"))
+            })?,
+            lengths.as_slice().map_err(|e| {
+                PyValueError::new_err(format!("lengths array must be contiguous: {e}"))
+            })?,
+            &chunk_grid_shape,
+            arr_offset.as_deref(),
+            checksum.map(|c| c.into()),
+        )?;
+
+        let store = Arc::clone(&self.0);
+        py.detach(move || {
+            let res = pyo3_async_runtimes::tokio::get_runtime().block_on(
+                do_set_virtual_refs(store, array_path, validate_containers, vrefs),
+            )?;
+            vrefs_result_to_py(res)
+        })
+    }
+
+    /// Async variant of `set_virtual_refs_arr`.
+    ///
+    /// The vref construction still requires the GIL (to borrow strings from
+    /// the Python list), but the store insertion releases it. Use
+    /// `asyncio.gather()` to overlap vref building for one array with store
+    /// insertion for another.
+    #[expect(clippy::too_many_arguments)]
+    #[pyo3(signature = (array_path, chunk_grid_shape, locations, offsets, lengths, *, validate_containers = true, arr_offset = None, checksum = None))]
+    fn set_virtual_refs_arr_async<'py>(
+        &'py self,
+        py: Python<'py>,
+        array_path: String,
+        chunk_grid_shape: Vec<u32>,
+        locations: &Bound<'_, PyList>,
+        offsets: PyReadonlyArray1<'_, u64>,
+        lengths: PyReadonlyArray1<'_, u64>,
+        validate_containers: bool,
+        arr_offset: Option<Vec<u32>>,
+        checksum: Option<ChecksumArgument>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let vrefs = build_vrefs_from_arrays(
+            locations,
+            offsets.as_slice().map_err(|e| {
+                PyValueError::new_err(format!("offsets array must be contiguous: {e}"))
+            })?,
+            lengths.as_slice().map_err(|e| {
+                PyValueError::new_err(format!("lengths array must be contiguous: {e}"))
+            })?,
+            &chunk_grid_shape,
+            arr_offset.as_deref(),
+            checksum.map(|c| c.into()),
+        )?;
+
+        let store = Arc::clone(&self.0);
+        pyo3_async_runtimes::tokio::future_into_py::<_, Option<Vec<Py<PyTuple>>>>(
+            py,
+            async move {
+                let res =
+                    do_set_virtual_refs(store, array_path, validate_containers, vrefs)
+                        .await?;
+                vrefs_result_to_py(res)
+            },
+        )
+    }
+
+    /// Async iterator yielding columnar batches of chunk references for one array.
+    ///
+    /// Each batch is a 6-tuple; row `i` across the columns describes one
+    /// chunk (columns are aligned in lock-step):
+    ///
+    /// ```text
+    ///   coords   : np.ndarray[uint32, (n, ndim)]  chunk grid coordinates
+    ///   kinds    : np.ndarray[uint8]              values of icechunk.ChunkType
+    ///                                              (native=1, virtual=2, inline=3)
+    ///   paths    : list[str]                      URL (virtual) | chunk_id (native) | "" (inline)
+    ///   offsets  : np.ndarray[uint64]             byte offset within the source
+    ///                                              URL (virtual) or chunk file
+    ///                                              (native); 0 for inline
+    ///   lengths  : np.ndarray[uint64]             byte length; equals
+    ///                                              len(bytes) for inline
+    ///   inlined  : dict[int, bytes]               *Inline rows only*. Keyed by
+    ///                                              the row index `i` in this
+    ///                                              batch. Rows whose kind is
+    ///                                              virtual, native, or missing
+    ///                                              are NOT present in this dict.
+    /// ```
+    ///
+    /// Native and virtual rows share the same `(path, offset, length)` shape;
+    /// the only structural difference is that `paths[i]` holds a bare
+    /// `chunk_id` for native rows vs a fully-resolved URL for virtual rows.
+    /// Consumers can therefore treat both uniformly as virtual references
+    /// after prepending a URL prefix to the `chunk_id`.
+    ///
+    /// Virtual locations are passed through the session's resolver before
+    /// yielding — relative `vcc://name/path` forms expand to absolute URLs;
+    /// absolute URLs pass through unchanged. Missing chunks are not yielded.
+    fn array_chunk_iterator(
+        &self,
+        array_path: String,
+        batch_size: u32,
+    ) -> PyResult<PyAsyncCloseableIterator> {
+        let store = Arc::clone(&self.0);
+        let res = try_stream! {
+            let session_lock = store.session();
+            let session = session_lock.read_owned().await;
+            let path = parse_array_path(array_path).map_err(|e| {
+                PyIcechunkStoreError::PyError(e)
+            })?;
+            let stream = session
+                .array_chunk_iterator(&path)
+                .await
+                .map_err(PyIcechunkStoreError::SessionError)
+                .chunks(batch_size as usize);
+
+            for await infos in stream {
+                let n = infos.len();
+                let mut coords_flat: Vec<u32> = Vec::new();
+                let mut kinds: Vec<u8> = Vec::with_capacity(n);
+                let mut paths: Vec<String> = Vec::with_capacity(n);
+                let mut offsets: Vec<u64> = Vec::with_capacity(n);
+                let mut lengths: Vec<u64> = Vec::with_capacity(n);
+                let mut inlined: Vec<(usize, Bytes)> = Vec::new();
+                let mut ndim: usize = 0;
+
+                for (i, ci_res) in infos.into_iter().enumerate() {
+                    let ci = ci_res?;
+                    ndim = ci.coord.0.len();
+                    coords_flat.extend_from_slice(&ci.coord.0);
+                    kinds.push(ChunkType::from(&ci.payload) as u8);
+                    match ci.payload {
+                        ChunkPayload::Virtual(VirtualChunkRef {
+                            location, offset, length, ..
+                        }) => {
+                            let url = session
+                                .resolve_virtual_location(&location)
+                                .map_err(|e| {
+                                    PyIcechunkStoreError::SessionError(
+                                        SessionError::capture(
+                                            SessionErrorKind::VirtualReferenceError(e.kind),
+                                        ),
+                                    )
+                                })?;
+                            paths.push(url);
+                            offsets.push(offset);
+                            lengths.push(length);
+                        }
+                        ChunkPayload::Ref(ChunkRef { id, offset, length }) => {
+                            paths.push(format!("{id}"));
+                            offsets.push(offset);
+                            lengths.push(length);
+                        }
+                        ChunkPayload::Inline(bytes) => {
+                            paths.push(String::new());
+                            offsets.push(0);
+                            lengths.push(bytes.len() as u64);
+                            inlined.push((i, bytes));
+                        }
+                        other => {
+                            Err(PyIcechunkStoreError::PyValueError(format!(
+                                "array_chunk_iterator encountered an unsupported ChunkPayload variant: {other:?}"
+                            )))?
+                        }
+                    }
+                }
+
+                let batch = Python::attach(|py| -> PyResult<Py<PyAny>> {
+                    let coords_arr = coords_flat
+                        .into_pyarray(py)
+                        .reshape((n, ndim))?
+                        .into_any()
+                        .unbind();
+                    let kinds_arr = kinds.into_pyarray(py).into_any().unbind();
+                    let offsets_arr = offsets.into_pyarray(py).into_any().unbind();
+                    let lengths_arr = lengths.into_pyarray(py).into_any().unbind();
+                    let paths_list: Py<PyAny> =
+                        PyList::new(py, paths)?.into_any().unbind();
+                    let inlined_dict = PyDict::new(py);
+                    for (i, b) in inlined {
+                        let slice: &[u8] = b.as_ref();
+                        inlined_dict.set_item(i, PyBytesType::new(py, slice))?;
+                    }
+                    let tup = PyTuple::new(
+                        py,
+                        [
+                            coords_arr,
+                            kinds_arr,
+                            paths_list,
+                            offsets_arr,
+                            lengths_arr,
+                            inlined_dict.into_any().unbind(),
+                        ],
+                    )?;
+                    Ok(tup.into_any().unbind())
+                })?;
+
+                yield batch;
+            }
+        };
+        let prepared = Arc::new(Mutex::new(res.boxed()));
+        Ok(PyAsyncCloseableIterator::new(prepared))
     }
 
     fn delete<'py>(
@@ -562,12 +818,11 @@ impl PyStore {
         Ok(supports_listing)
     }
 
-    fn list(&self, py: Python<'_>) -> PyIcechunkStoreResult<PyAsyncGenerator> {
+    fn list(&self, py: Python<'_>) -> PyIcechunkStoreResult<PyAsyncCloseableIterator> {
         // This is blocking function, we need to release the Gil
         py.detach(move || {
             let store = Arc::clone(&self.0);
 
-            #[allow(deprecated)]
             let list = pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(async move { store.list().await })?
                 .map_err(PyIcechunkStoreError::StoreError)
@@ -579,7 +834,7 @@ impl PyStore {
                 .err_into();
 
             let prepared_list = Arc::new(Mutex::new(list.boxed()));
-            Ok(PyAsyncGenerator::new(prepared_list))
+            Ok(PyAsyncCloseableIterator::new(prepared_list))
         })
     }
 
@@ -587,12 +842,11 @@ impl PyStore {
         &self,
         py: Python<'_>,
         prefix: String,
-    ) -> PyIcechunkStoreResult<PyAsyncGenerator> {
+    ) -> PyIcechunkStoreResult<PyAsyncCloseableIterator> {
         // This is blocking function, we need to release the Gil
         py.detach(move || {
             let store = Arc::clone(&self.0);
 
-            #[allow(deprecated)]
             let list = pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(async move { store.list_prefix(prefix.as_str()).await })?
                 .map_err(PyIcechunkStoreError::StoreError)
@@ -603,7 +857,7 @@ impl PyStore {
                 })
                 .err_into();
             let prepared_list = Arc::new(Mutex::new(list.boxed()));
-            Ok(PyAsyncGenerator::new(prepared_list))
+            Ok(PyAsyncCloseableIterator::new(prepared_list))
         })
     }
 
@@ -611,12 +865,11 @@ impl PyStore {
         &self,
         py: Python<'_>,
         prefix: String,
-    ) -> PyIcechunkStoreResult<PyAsyncGenerator> {
+    ) -> PyIcechunkStoreResult<PyAsyncCloseableIterator> {
         // This is blocking function, we need to release the Gil
         py.detach(move || {
             let store = Arc::clone(&self.0);
 
-            #[allow(deprecated)]
             let list = pyo3_async_runtimes::tokio::get_runtime()
                 .block_on(async move { store.list_dir(prefix.as_str()).await })?
                 .map_err(PyIcechunkStoreError::StoreError)
@@ -627,7 +880,7 @@ impl PyStore {
                 })
                 .err_into();
             let prepared_list = Arc::new(Mutex::new(list.boxed()));
-            Ok(PyAsyncGenerator::new(prepared_list))
+            Ok(PyAsyncCloseableIterator::new(prepared_list))
         })
     }
 

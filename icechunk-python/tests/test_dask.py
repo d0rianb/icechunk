@@ -5,12 +5,14 @@ pytest.importorskip("distributed")
 
 import tempfile
 
+import numpy as np
+
 import dask
 import distributed
 import xarray as xr
 import zarr
 from icechunk import Repository, local_filesystem_storage
-from icechunk.dask import store_dask
+from icechunk.dask import session_merge_reduction, store_dask
 from icechunk.xarray import to_icechunk
 from tests.test_xarray import create_test_data, roundtrip
 from xarray.testing import assert_identical
@@ -37,22 +39,16 @@ def test_store_dask(any_spec_version: int | None) -> None:
             dtype="f8",
             fill_value=float("nan"),
         )
-        # can't fork a dirty session
-        with dask.config.set(scheduler="processes"):
-            with pytest.raises(ValueError):
-                store_dask(sources=[dask_array], targets=[zarray])
 
-        # session = repo.writable_session("main")
-        # Can't fork a dirty session
-        with pytest.raises(ValueError):
-            fork = session.fork()
-
-        session.commit("i am forced to commit to make progress")
-        session = repo.writable_session("main")
         fork = session.fork()
         zarray = zarr.open_array(fork.store, path="array")
         with dask.config.set(scheduler="processes"):
             store_dask(sources=[dask_array], targets=[zarray])
+
+
+def test_session_merge_reduction_rejects_unknown_arrays() -> None:
+    with pytest.raises(TypeError, match="Expected a dask array"):
+        session_merge_reduction(np.arange(10), split_every=None)  # type: ignore[arg-type]
 
 
 def test_distributed(any_spec_version: int | None) -> None:
@@ -87,19 +83,20 @@ def test_xarray_to_icechunk_nested_pickling(
             session = repo.writable_session("main")
 
             to_icechunk(ds, session=session, mode="w")
-            with pytest.raises(ValueError, match="Please commit first"):
-                to_icechunk(ds, session=session, mode="w")
-            # Needed because we can't pickle the writable session for distributed read
-            session.commit("wrote a commit.")
-            with xr.open_zarr(session.store, consolidated=False) as actual:
+            with xr.open_zarr(session.store, consolidated=False, chunks=None) as actual:
+                assert_identical(actual, ds)
+            to_icechunk(ds, session=session, mode="w")
+            with xr.open_zarr(session.store, consolidated=False, chunks=None) as actual:
+                assert_identical(actual, ds)
+            with xr.open_zarr(session.fork().store, consolidated=False) as actual:
                 assert_identical(actual, ds)
 
             newds = ds + 1
             session = repo.writable_session("main")
             to_icechunk(newds, session=session, mode="w")
-            # Needed because we can't pickle the writable session
-            session.commit("wrote another commit.")
-            with xr.open_zarr(session.store, consolidated=False) as actual:
+            with xr.open_zarr(session.store, consolidated=False, chunks=None) as actual:
+                assert_identical(actual, newds)
+            with xr.open_zarr(session.fork().store, consolidated=False) as actual:
                 assert_identical(actual, newds)
 
 

@@ -1,22 +1,84 @@
 import datetime
-from collections.abc import AsyncIterator, Iterator
+import json
+import warnings
+from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any, Self, cast
 
-from icechunk import ConflictSolver
 from icechunk._icechunk_python import (
-    Diff,
-    GCSummary,
-    ManifestFileInfo,
+    AncestryGraph,
+    AsyncCloseableIterator,
+    ChunkStorageStats,
     PyRepository,
-    RepositoryConfig,
-    SnapshotInfo,
-    Storage,
-    UpdateType,
+    RepoStatus,
+    SpecVersion,
 )
+from icechunk.config import Attribution, FeatureFlag, RepositoryConfig
+from icechunk.conflicts import ConflictSolver
 from icechunk.credentials import AnyCredential
+from icechunk.ops import GCSummary, Update
 from icechunk.session import Session
+from icechunk.snapshots import Diff, ManifestFileInfo, SnapshotInfo
+from icechunk.storage import Storage, StorageSettings
 from icechunk.store import IcechunkStore
+from icechunk.types import CommitMethod
+
+
+def _none_credential_guidance(scheme: str) -> tuple[str, str]:
+    """The explicit replacement expression and (for S3) a security note for a deprecated
+    `None` credential, keyed by the container's url prefix scheme.
+
+    Scheme matching is reliable because icechunk enforces scheme/store correspondence
+    when containers are created: `s3://`/`tigris://` are exactly the S3-family stores
+    (including S3-compatible), `gs://`/`gcs://` GCS, `az://`/`azure://`/`abfs://` Azure,
+    `http(s)://` HTTP, and `file://` local.
+    """
+    if scheme in ("s3", "tigris"):
+        # FromEnv preserves the current `None` behaviour; use ic.s3_anonymous_credentials()
+        # for public buckets instead.
+        return "ic.Credentials.S3(ic.S3Credentials.FromEnv())", (
+            " Note that `None` currently reads credentials from your environment "
+            "(or uses anonymous access), which can expose private credentials."
+        )
+    if scheme in ("gs", "gcs"):
+        return "ic.Credentials.Gcs(ic.GcsCredentials.Anonymous())", ""
+    if scheme in ("az", "azure", "abfs"):
+        return "ic.Credentials.Azure(ic.AzureCredentials.FromEnv())", ""
+    if scheme == "file":
+        return "ic.credentials.LocalFileSystemAccess", ""
+    if scheme in ("http", "https"):
+        return "ic.credentials.HttpAccess", ""
+    # Not a supported virtual-chunk container scheme; `...` is a placeholder.
+    return "...", ""
+
+
+def _warn_on_none_virtual_chunk_credentials(
+    authorize_virtual_chunk_access: dict[str, "AnyCredential | None"] | None,
+) -> None:
+    """Emit a deprecation warning for any `None` credential in the authorization map.
+
+    `None` is overloaded and silently permissive (icechunk#2194); it is being replaced by
+    explicit per-backend sentinels and will be rejected in a future release.
+    """
+    if not authorize_virtual_chunk_access:
+        return
+    issue = "https://github.com/earth-mover/icechunk/issues/2194"
+    for url_prefix, cred in authorize_virtual_chunk_access.items():
+        if cred is not None:
+            continue
+        scheme = url_prefix.split("://", 1)[0]
+        replacement, security_note = _none_credential_guidance(scheme)
+        example = (
+            'authorize_virtual_chunk_access={"' + url_prefix + '": ' + replacement + "}"
+        )
+        warnings.warn(
+            f"Passing `None` in `authorize_virtual_chunk_access` for container "
+            f"`{url_prefix}` is deprecated and will be unsupported in a future release; "
+            f"pass an explicit credential or no-auth sentinel instead. For example:\n"
+            f"    {example}{security_note} See {issue} for details.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
 
 
 class Repository:
@@ -27,13 +89,24 @@ class Repository:
     def __init__(self, repository: PyRepository):
         self._repository = repository
 
+    def __repr__(self) -> str:
+        return repr(self._repository)
+
+    def __str__(self) -> str:
+        return str(self._repository)
+
+    def _repr_html_(self) -> str:
+        return self._repository._repr_html_()
+
     @classmethod
     def create(
         cls,
         storage: Storage,
         config: RepositoryConfig | None = None,
         authorize_virtual_chunk_access: dict[str, AnyCredential | None] | None = None,
-        spec_version: int | None = None,
+        spec_version: SpecVersion | int | None = None,
+        check_clean_root: bool = True,
+        attribution: Attribution | None = None,
     ) -> Self:
         """
         Create a new Icechunk repository.
@@ -52,25 +125,42 @@ class Repository:
         authorize_virtual_chunk_access : dict[str, AnyCredential | None], optional
             Authorize Icechunk to access virtual chunks in these containers. A mapping
             from container url_prefix to the credentials to use to access chunks in
-            that container. If credential is `None`, they will be fetched from the
-            environment, or anonymous credentials will be used if the container allows it.
+            that container. Keys are matched exactly against the configured containers'
+            url_prefix, not by prefix (e.g., authorizing ``s3://bucket/`` does not authorize a
+            container defined at ``s3://bucket/sub/``). Keys that match no container
+            are ignored. Each value should be an explicit credential or no-auth
+            sentinel: e.g. ``S3Credentials.FromEnv()`` / ``s3_anonymous_credentials()``
+            for S3, or the ``icechunk.credentials.LocalFileSystemAccess`` /
+            ``icechunk.credentials.HttpAccess`` sentinels for ``file://`` and
+            ``http(s)://`` containers. Passing ``None`` is deprecated and will be
+            unsupported in a future release: it silently reads credentials from the
+            environment (or uses anonymous access), which can expose private credentials.
             As a security measure, Icechunk will block access to virtual chunks if the
             container is not authorized using this argument.
-        spec_version : int, optional
+        spec_version : SpecVersion, optional
             Use this version of the spec for the new repository. If not passed, the latest version
             of the spec that was available before the library version release will be used.
+        attribution : Attribution, optional
+            Labels icechunk adds to the ``User-Agent`` of every request it makes for
+            this repository, so the bucket owner can attribute traffic in access logs.
+            The array path and chunk coordinates are always added; this adds which
+            software is talking to the bucket (``client``), what it is doing
+            (``workload``) and on whose behalf (``principal``).
 
         Returns
         -------
         Self
             An instance of the Repository class.
         """
+        _warn_on_none_virtual_chunk_credentials(authorize_virtual_chunk_access)
         return cls(
             PyRepository.create(
                 storage,
                 config=config,
                 authorize_virtual_chunk_access=authorize_virtual_chunk_access,
                 spec_version=spec_version,
+                check_clean_root=check_clean_root,
+                attribution=attribution,
             )
         )
 
@@ -80,7 +170,9 @@ class Repository:
         storage: Storage,
         config: RepositoryConfig | None = None,
         authorize_virtual_chunk_access: dict[str, AnyCredential | None] | None = None,
-        spec_version: int | None = None,
+        spec_version: SpecVersion | int | None = None,
+        check_clean_root: bool = True,
+        attribution: Attribution | None = None,
     ) -> Self:
         """
         Create a new Icechunk repository asynchronously.
@@ -99,25 +191,42 @@ class Repository:
         authorize_virtual_chunk_access : dict[str, AnyCredential | None], optional
             Authorize Icechunk to access virtual chunks in these containers. A mapping
             from container url_prefix to the credentials to use to access chunks in
-            that container. If credential is `None`, they will be fetched from the
-            environment, or anonymous credentials will be used if the container allows it.
+            that container. Keys are matched exactly against the configured containers'
+            url_prefix, not by prefix (e.g., authorizing ``s3://bucket/`` does not authorize a
+            container defined at ``s3://bucket/sub/``). Keys that match no container
+            are ignored. Each value should be an explicit credential or no-auth
+            sentinel: e.g. ``S3Credentials.FromEnv()`` / ``s3_anonymous_credentials()``
+            for S3, or the ``icechunk.credentials.LocalFileSystemAccess`` /
+            ``icechunk.credentials.HttpAccess`` sentinels for ``file://`` and
+            ``http(s)://`` containers. Passing ``None`` is deprecated and will be
+            unsupported in a future release: it silently reads credentials from the
+            environment (or uses anonymous access), which can expose private credentials.
             As a security measure, Icechunk will block access to virtual chunks if the
             container is not authorized using this argument.
-        spec_version : int, optional
+        spec_version : SpecVersion, optional
             Use this version of the spec for the new repository. If not passed, the latest version
             of the spec that was available before the library version release will be used.
+        attribution : Attribution, optional
+            Labels icechunk adds to the ``User-Agent`` of every request it makes for
+            this repository, so the bucket owner can attribute traffic in access logs.
+            The array path and chunk coordinates are always added; this adds which
+            software is talking to the bucket (``client``), what it is doing
+            (``workload``) and on whose behalf (``principal``).
 
         Returns
         -------
         Self
             An instance of the Repository class.
         """
+        _warn_on_none_virtual_chunk_credentials(authorize_virtual_chunk_access)
         return cls(
             await PyRepository.create_async(
                 storage,
                 config=config,
                 authorize_virtual_chunk_access=authorize_virtual_chunk_access,
                 spec_version=spec_version,
+                check_clean_root=check_clean_root,
+                attribution=attribution,
             )
         )
 
@@ -127,6 +236,7 @@ class Repository:
         storage: Storage,
         config: RepositoryConfig | None = None,
         authorize_virtual_chunk_access: dict[str, AnyCredential | None] | None = None,
+        attribution: Attribution | None = None,
     ) -> Self:
         """
         Open an existing Icechunk repository.
@@ -135,7 +245,7 @@ class Repository:
 
         !!! warning
             This method must be used with care in a multiprocessing context.
-            Read more in our [Parallel Write Guide](./parallel.md#uncooperative-distributed-writes).
+            Read more in our [Parallel Write Guide](../understanding/parallel.md#uncooperative-distributed-writes).
 
         Parameters
         ----------
@@ -147,21 +257,37 @@ class Repository:
         authorize_virtual_chunk_access : dict[str, AnyCredential | None], optional
             Authorize Icechunk to access virtual chunks in these containers. A mapping
             from container url_prefix to the credentials to use to access chunks in
-            that container. If credential is `None`, they will be fetched from the
-            environment, or anonymous credentials will be used if the container allows it.
+            that container. Keys are matched exactly against the configured containers'
+            url_prefix, not by prefix (e.g., authorizing ``s3://bucket/`` does not authorize a
+            container defined at ``s3://bucket/sub/``). Keys that match no container
+            are ignored. Each value should be an explicit credential or no-auth
+            sentinel: e.g. ``S3Credentials.FromEnv()`` / ``s3_anonymous_credentials()``
+            for S3, or the ``icechunk.credentials.LocalFileSystemAccess`` /
+            ``icechunk.credentials.HttpAccess`` sentinels for ``file://`` and
+            ``http(s)://`` containers. Passing ``None`` is deprecated and will be
+            unsupported in a future release: it silently reads credentials from the
+            environment (or uses anonymous access), which can expose private credentials.
             As a security measure, Icechunk will block access to virtual chunks if the
             container is not authorized using this argument.
+        attribution : Attribution, optional
+            Labels icechunk adds to the ``User-Agent`` of every request it makes for
+            this repository, so the bucket owner can attribute traffic in access logs.
+            The array path and chunk coordinates are always added; this adds which
+            software is talking to the bucket (``client``), what it is doing
+            (``workload``) and on whose behalf (``principal``).
 
         Returns
         -------
         Self
             An instance of the Repository class.
         """
+        _warn_on_none_virtual_chunk_credentials(authorize_virtual_chunk_access)
         return cls(
             PyRepository.open(
                 storage,
                 config=config,
                 authorize_virtual_chunk_access=authorize_virtual_chunk_access,
+                attribution=attribution,
             )
         )
 
@@ -171,6 +297,7 @@ class Repository:
         storage: Storage,
         config: RepositoryConfig | None = None,
         authorize_virtual_chunk_access: dict[str, AnyCredential | None] | None = None,
+        attribution: Attribution | None = None,
     ) -> Self:
         """
         Open an existing Icechunk repository asynchronously.
@@ -179,7 +306,7 @@ class Repository:
 
         !!! warning
             This method must be used with care in a multiprocessing context.
-            Read more in our [Parallel Write Guide](./parallel.md#uncooperative-distributed-writes).
+            Read more in our [Parallel Write Guide](../understanding/parallel.md#uncooperative-distributed-writes).
 
         Parameters
         ----------
@@ -191,21 +318,37 @@ class Repository:
         authorize_virtual_chunk_access : dict[str, AnyCredential | None], optional
             Authorize Icechunk to access virtual chunks in these containers. A mapping
             from container url_prefix to the credentials to use to access chunks in
-            that container. If credential is `None`, they will be fetched from the
-            environment, or anonymous credentials will be used if the container allows it.
+            that container. Keys are matched exactly against the configured containers'
+            url_prefix, not by prefix (e.g., authorizing ``s3://bucket/`` does not authorize a
+            container defined at ``s3://bucket/sub/``). Keys that match no container
+            are ignored. Each value should be an explicit credential or no-auth
+            sentinel: e.g. ``S3Credentials.FromEnv()`` / ``s3_anonymous_credentials()``
+            for S3, or the ``icechunk.credentials.LocalFileSystemAccess`` /
+            ``icechunk.credentials.HttpAccess`` sentinels for ``file://`` and
+            ``http(s)://`` containers. Passing ``None`` is deprecated and will be
+            unsupported in a future release: it silently reads credentials from the
+            environment (or uses anonymous access), which can expose private credentials.
             As a security measure, Icechunk will block access to virtual chunks if the
             container is not authorized using this argument.
+        attribution : Attribution, optional
+            Labels icechunk adds to the ``User-Agent`` of every request it makes for
+            this repository, so the bucket owner can attribute traffic in access logs.
+            The array path and chunk coordinates are always added; this adds which
+            software is talking to the bucket (``client``), what it is doing
+            (``workload``) and on whose behalf (``principal``).
 
         Returns
         -------
         Self
             An instance of the Repository class.
         """
+        _warn_on_none_virtual_chunk_credentials(authorize_virtual_chunk_access)
         return cls(
             await PyRepository.open_async(
                 storage,
                 config=config,
                 authorize_virtual_chunk_access=authorize_virtual_chunk_access,
+                attribution=attribution,
             )
         )
 
@@ -215,14 +358,16 @@ class Repository:
         storage: Storage,
         config: RepositoryConfig | None = None,
         authorize_virtual_chunk_access: dict[str, AnyCredential | None] | None = None,
-        create_version: int | None = None,
+        create_version: SpecVersion | int | None = None,
+        check_clean_root: bool = True,
+        attribution: Attribution | None = None,
     ) -> Self:
         """
         Open an existing Icechunk repository or create a new one if it does not exist.
 
         !!! warning
             This method must be used with care in a multiprocessing context.
-            Read more in our [Parallel Write Guide](./parallel.md#uncooperative-distributed-writes).
+            Read more in our [Parallel Write Guide](../understanding/parallel.md#uncooperative-distributed-writes).
 
             Attempting to create a Repo concurrently in the same location from multiple processes is not safe.
             Instead, create a Repo once and then open it concurrently.
@@ -237,14 +382,28 @@ class Repository:
         authorize_virtual_chunk_access : dict[str, AnyCredential | None], optional
             Authorize Icechunk to access virtual chunks in these containers. A mapping
             from container url_prefix to the credentials to use to access chunks in
-            that container. If credential is `None`, they will be fetched from the
-            environment, or anonymous credentials will be used if the container allows it.
+            that container. Keys are matched exactly against the configured containers'
+            url_prefix, not by prefix (e.g., authorizing ``s3://bucket/`` does not authorize a
+            container defined at ``s3://bucket/sub/``). Keys that match no container
+            are ignored. Each value should be an explicit credential or no-auth
+            sentinel: e.g. ``S3Credentials.FromEnv()`` / ``s3_anonymous_credentials()``
+            for S3, or the ``icechunk.credentials.LocalFileSystemAccess`` /
+            ``icechunk.credentials.HttpAccess`` sentinels for ``file://`` and
+            ``http(s)://`` containers. Passing ``None`` is deprecated and will be
+            unsupported in a future release: it silently reads credentials from the
+            environment (or uses anonymous access), which can expose private credentials.
             As a security measure, Icechunk will block access to virtual chunks if the
             container is not authorized using this argument.
-        create_version : int, optional
+        create_version : SpecVersion, optional
             Use this version of the spec for the new repository, if it needs to be created.
             If not passed, the latest version of the spec that was available before the
             library version release will be used.
+        attribution : Attribution, optional
+            Labels icechunk adds to the ``User-Agent`` of every request it makes for
+            this repository, so the bucket owner can attribute traffic in access logs.
+            The array path and chunk coordinates are always added; this adds which
+            software is talking to the bucket (``client``), what it is doing
+            (``workload``) and on whose behalf (``principal``).
 
 
         Returns
@@ -252,12 +411,15 @@ class Repository:
         Self
             An instance of the Repository class.
         """
+        _warn_on_none_virtual_chunk_credentials(authorize_virtual_chunk_access)
         return cls(
             PyRepository.open_or_create(
                 storage,
                 config=config,
                 authorize_virtual_chunk_access=authorize_virtual_chunk_access,
                 create_version=create_version,
+                check_clean_root=check_clean_root,
+                attribution=attribution,
             )
         )
 
@@ -267,14 +429,16 @@ class Repository:
         storage: Storage,
         config: RepositoryConfig | None = None,
         authorize_virtual_chunk_access: dict[str, AnyCredential | None] | None = None,
-        create_version: int | None = None,
+        create_version: SpecVersion | int | None = None,
+        check_clean_root: bool = True,
+        attribution: Attribution | None = None,
     ) -> Self:
         """
         Open an existing Icechunk repository or create a new one if it does not exist (async version).
 
         !!! warning
             This method must be used with care in a multiprocessing context.
-            Read more in our [Parallel Write Guide](./parallel.md#uncooperative-distributed-writes).
+            Read more in our [Parallel Write Guide](../understanding/parallel.md#uncooperative-distributed-writes).
 
             Attempting to create a Repo concurrently in the same location from multiple processes is not safe.
             Instead, create a Repo once and then open it concurrently.
@@ -289,31 +453,51 @@ class Repository:
         authorize_virtual_chunk_access : dict[str, AnyCredential | None], optional
             Authorize Icechunk to access virtual chunks in these containers. A mapping
             from container url_prefix to the credentials to use to access chunks in
-            that container. If credential is `None`, they will be fetched from the
-            environment, or anonymous credentials will be used if the container allows it.
+            that container. Keys are matched exactly against the configured containers'
+            url_prefix, not by prefix (e.g., authorizing ``s3://bucket/`` does not authorize a
+            container defined at ``s3://bucket/sub/``). Keys that match no container
+            are ignored. Each value should be an explicit credential or no-auth
+            sentinel: e.g. ``S3Credentials.FromEnv()`` / ``s3_anonymous_credentials()``
+            for S3, or the ``icechunk.credentials.LocalFileSystemAccess`` /
+            ``icechunk.credentials.HttpAccess`` sentinels for ``file://`` and
+            ``http(s)://`` containers. Passing ``None`` is deprecated and will be
+            unsupported in a future release: it silently reads credentials from the
+            environment (or uses anonymous access), which can expose private credentials.
             As a security measure, Icechunk will block access to virtual chunks if the
             container is not authorized using this argument.
-        create_version : int, optional
+        create_version : SpecVersion, optional
             Use this version of the spec for the new repository, if it needs to be created.
             If not passed, the latest version of the spec that was available before the
             library version release will be used.
+        attribution : Attribution, optional
+            Labels icechunk adds to the ``User-Agent`` of every request it makes for
+            this repository, so the bucket owner can attribute traffic in access logs.
+            The array path and chunk coordinates are always added; this adds which
+            software is talking to the bucket (``client``), what it is doing
+            (``workload``) and on whose behalf (``principal``).
 
         Returns
         -------
         Self
             An instance of the Repository class.
         """
+        _warn_on_none_virtual_chunk_credentials(authorize_virtual_chunk_access)
         return cls(
             await PyRepository.open_or_create_async(
                 storage,
                 config=config,
                 authorize_virtual_chunk_access=authorize_virtual_chunk_access,
                 create_version=create_version,
+                check_clean_root=check_clean_root,
+                attribution=attribution,
             )
         )
 
     @staticmethod
-    def exists(storage: Storage) -> bool:
+    def exists(
+        storage: Storage,
+        storage_settings: StorageSettings | None = None,
+    ) -> bool:
         """
         Check if a repository exists at the given storage location.
 
@@ -321,16 +505,21 @@ class Repository:
         ----------
         storage : Storage
             The storage configuration for the repository.
+        storage_settings : StorageSettings | None
+            Optional storage settings to use for the initial storage call.
 
         Returns
         -------
         bool
             True if the repository exists, False otherwise.
         """
-        return PyRepository.exists(storage)
+        return PyRepository.exists(storage, storage_settings)
 
     @staticmethod
-    async def exists_async(storage: Storage) -> bool:
+    async def exists_async(
+        storage: Storage,
+        storage_settings: StorageSettings | None = None,
+    ) -> bool:
         """
         Check if a repository exists at the given storage location (async version).
 
@@ -338,13 +527,67 @@ class Repository:
         ----------
         storage : Storage
             The storage configuration for the repository.
+        storage_settings : StorageSettings | None
+            Optional storage settings to use for the initial storage call.
 
         Returns
         -------
         bool
             True if the repository exists, False otherwise.
         """
-        return await PyRepository.exists_async(storage)
+        return await PyRepository.exists_async(storage, storage_settings)
+
+    @staticmethod
+    def fetch_spec_version(
+        storage: Storage,
+        storage_settings: StorageSettings | None = None,
+    ) -> SpecVersion | None:
+        """
+        Fetch the spec version of a repository without fully opening it.
+
+        This is useful for checking the repository format version before opening,
+        for example to know what version of the library is needed to open it.
+
+        Parameters
+        ----------
+        storage : Storage
+            The storage configuration for the repository.
+        storage_settings : StorageSettings | None
+            Optional storage settings to use for the initial storage call.
+
+        Returns
+        -------
+        SpecVersion | None
+            The spec version of the repository if it exists, None if no repository
+            exists at the given location.
+        """
+        return PyRepository.fetch_spec_version(storage, storage_settings)
+
+    @staticmethod
+    async def fetch_spec_version_async(
+        storage: Storage,
+        storage_settings: StorageSettings | None = None,
+    ) -> SpecVersion | None:
+        """
+        Fetch the spec version of a repository without fully opening it (async version).
+
+        This is useful for checking the repository format version before opening,
+        for example to know what version of the library is needed to open it.
+
+        Parameters
+        ----------
+        storage : Storage
+            The storage configuration for the repository.
+        storage_settings : StorageSettings | None
+            Optional storage settings to use for the initial storage call.
+
+        Returns
+        -------
+        SpecVersion | None
+            The spec version of the repository if it exists, None if no repository
+            exists at the given location.
+        """
+        return await PyRepository.fetch_spec_version_async(storage, storage_settings)
 
     def __getstate__(self) -> object:
         return {
@@ -353,7 +596,7 @@ class Repository:
 
     def __setstate__(self, state: object) -> None:
         if not isinstance(state, dict):
-            raise ValueError("Invalid repository state")
+            raise ValueError("Invalid repository state")  # noqa: TRY004
         self._repository = PyRepository.from_bytes(state["_repository"])
 
     @staticmethod
@@ -423,6 +666,18 @@ class Repository:
         return self._repository.config()
 
     @property
+    def attribution(self) -> Attribution:
+        """
+        Get the labels this repository attaches to its requests.
+
+        Returns
+        -------
+        Attribution
+            The repository's request attribution.
+        """
+        return self._repository.attribution
+
+    @property
     def storage(self) -> Storage:
         """
         Get a copy of this repository's Storage instance.
@@ -466,6 +721,7 @@ class Repository:
         Self
             A new Repository instance with the updated configuration.
         """
+        _warn_on_none_virtual_chunk_credentials(authorize_virtual_chunk_access)
         return self.__class__(
             self._repository.reopen(
                 config=config,
@@ -493,6 +749,7 @@ class Repository:
         Self
             A new Repository instance with the updated configuration.
         """
+        _warn_on_none_virtual_chunk_credentials(authorize_virtual_chunk_access)
         return self.__class__(
             await self._repository.reopen_async(
                 config=config,
@@ -616,6 +873,154 @@ class Repository:
         """
         return await self._repository.update_metadata_async(metadata)
 
+    def get_status(self) -> RepoStatus:
+        """
+        Get the current repository status.
+
+        Returns
+        -------
+        RepoStatus
+            The current status of the repository.
+        """
+        return self._repository.get_status()
+
+    @property
+    def status(self) -> RepoStatus:
+        """
+        Get the current repository status.
+
+        Returns
+        -------
+        RepoStatus
+            The current status of the repository.
+        """
+        return self._repository.get_status()
+
+    async def get_status_async(self) -> RepoStatus:
+        """
+        Get the current repository status (async version).
+
+        Returns
+        -------
+        RepoStatus
+            The current status of the repository.
+        """
+        return await self._repository.get_status_async()
+
+    def set_status(self, status: RepoStatus) -> None:
+        """
+        Set the repository status.
+
+        Parameters
+        ----------
+        status : RepoStatus
+            The new status for the repository.
+        """
+        self._repository.set_status(status)
+
+    async def set_status_async(self, status: RepoStatus) -> None:
+        """
+        Set the repository status (async version).
+
+        Parameters
+        ----------
+        status : RepoStatus
+            The new status for the repository.
+        """
+        await self._repository.set_status_async(status)
+
+    def feature_flags(self) -> list[FeatureFlag]:
+        """
+        Get all feature flags and their current state.
+
+        Returns
+        -------
+        list[FeatureFlag]
+            All feature flags with their id, name, default, setting, and effective state.
+        """
+        return self._repository.feature_flags()
+
+    async def feature_flags_async(self) -> list[FeatureFlag]:
+        """
+        Get all feature flags and their current state (async version).
+
+        Returns
+        -------
+        list[FeatureFlag]
+            All feature flags with their id, name, default, setting, and effective state.
+        """
+        return await self._repository.feature_flags_async()
+
+    def enabled_feature_flags(self) -> list[FeatureFlag]:
+        """
+        Get feature flags that are currently enabled.
+
+        Returns
+        -------
+        list[FeatureFlag]
+            Feature flags whose effective state is enabled.
+        """
+        return self._repository.enabled_feature_flags()
+
+    async def enabled_feature_flags_async(self) -> list[FeatureFlag]:
+        """
+        Get feature flags that are currently enabled (async version).
+
+        Returns
+        -------
+        list[FeatureFlag]
+            Feature flags whose effective state is enabled.
+        """
+        return await self._repository.enabled_feature_flags_async()
+
+    def disabled_feature_flags(self) -> list[FeatureFlag]:
+        """
+        Get feature flags that are currently disabled.
+
+        Returns
+        -------
+        list[FeatureFlag]
+            Feature flags whose effective state is disabled.
+        """
+        return self._repository.disabled_feature_flags()
+
+    async def disabled_feature_flags_async(self) -> list[FeatureFlag]:
+        """
+        Get feature flags that are currently disabled (async version).
+
+        Returns
+        -------
+        list[FeatureFlag]
+            Feature flags whose effective state is disabled.
+        """
+        return await self._repository.disabled_feature_flags_async()
+
+    def set_feature_flag(self, name: str, setting: bool | None) -> None:
+        """
+        Set a feature flag.
+
+        Parameters
+        ----------
+        name : str
+            The name of the feature flag.
+        setting : bool | None
+            True to enable, False to disable, None to reset to default.
+        """
+        self._repository.set_feature_flag(name, setting)
+
+    async def set_feature_flag_async(self, name: str, setting: bool | None) -> None:
+        """
+        Set a feature flag (async version).
+
+        Parameters
+        ----------
+        name : str
+            The name of the feature flag.
+        setting : bool | None
+            True to enable, False to disable, None to reset to default.
+        """
+        await self._repository.set_feature_flag_async(name, setting)
+
     def ancestry(
         self,
         *,
@@ -660,7 +1065,7 @@ class Repository:
         branch: str | None = None,
         tag: str | None = None,
         snapshot_id: str | None = None,
-    ) -> AsyncIterator[SnapshotInfo]:
+    ) -> AsyncCloseableIterator[SnapshotInfo]:
         """
         Get the ancestry of a snapshot.
 
@@ -686,19 +1091,70 @@ class Repository:
             branch=branch, tag=tag, snapshot_id=snapshot_id
         )
 
-    def ops_log(self) -> Iterator[UpdateType]:
+    def ancestry_graph(
+        self,
+        *,
+        branch: str | None = None,
+        tag: str | None = None,
+        snapshot_id: str | None = None,
+        plain: bool = False,
+    ) -> AncestryGraph:
+        """
+        Build a visual representation of the commit history.
+
+        When called with no arguments, shows all branches as a tree.
+        When called with one of branch/tag/snapshot_id, shows that ref's linear history.
+
+        Parameters
+        ----------
+        branch : str, optional
+            Show history for this branch.
+        tag : str, optional
+            Show history from this tag.
+        snapshot_id : str, optional
+            Show history from this snapshot.
+        plain : bool, optional
+            If True, render without colors (no ANSI codes in text, no fill colors
+            in SVG). Useful for CI logs, piping to files, or LLM agents.
+
+        Returns
+        -------
+        AncestryGraph
+            A displayable object. Use print() for colored terminal output,
+            or display in Jupyter for an SVG diagram.
+        """
+        return self._repository.ancestry_graph(
+            branch=branch, tag=tag, snapshot_id=snapshot_id, plain=plain
+        )
+
+    async def ancestry_graph_async(
+        self,
+        *,
+        branch: str | None = None,
+        tag: str | None = None,
+        snapshot_id: str | None = None,
+        plain: bool = False,
+    ) -> AncestryGraph:
+        """
+        Async version of :meth:`ancestry_graph`.
+        """
+        return await self._repository.ancestry_graph_async(
+            branch=branch, tag=tag, snapshot_id=snapshot_id, plain=plain
+        )
+
+    def ops_log(self) -> Iterator[Update]:
         """
         Get a summary of changes to the repository
         """
 
         # the returned object is both an Async and Sync iterator
         res = cast(
-            Iterator[UpdateType],
+            Iterator[Update],
             self._repository.async_ops_log(),
         )
         return res
 
-    def ops_log_async(self) -> AsyncIterator[UpdateType]:
+    def ops_log_async(self) -> AsyncCloseableIterator[Update]:
         """
         Get a summary of changes to the repository
         """
@@ -1365,11 +1821,16 @@ class Repository:
         Parameters
         ----------
         older_than: datetime.datetime
-            Expire snapshots older than this time.
+            Expire snapshots older than this time. The bound is exclusive: a
+            snapshot whose ``written_at`` equals ``older_than`` is kept. The root
+            snapshot and the main branch tip are never expired. Other branch and
+            tag tips are kept unless ``delete_expired_branches`` /
+            ``delete_expired_tags`` are True.
         delete_expired_branches: bool, optional
-            Whether to delete any branches that now have only expired snapshots.
+            Whether to delete branches whose tip points at an expired snapshot.
+            The main branch is never deleted.
         delete_expired_tags: bool, optional
-            Whether to delete any tags associated with expired snapshots
+            Whether to delete tags whose tip points at an expired snapshot.
 
         Returns
         -------
@@ -1412,11 +1873,16 @@ class Repository:
         Parameters
         ----------
         older_than: datetime.datetime
-            Expire snapshots older than this time.
+            Expire snapshots older than this time. The bound is exclusive: a
+            snapshot whose ``written_at`` equals ``older_than`` is kept. The root
+            snapshot and the main branch tip are never expired. Other branch and
+            tag tips are kept unless ``delete_expired_branches`` /
+            ``delete_expired_tags`` are True.
         delete_expired_branches: bool, optional
-            Whether to delete any branches that now have only expired snapshots.
+            Whether to delete branches whose tip points at an expired snapshot.
+            The main branch is never deleted.
         delete_expired_tags: bool, optional
-            Whether to delete any tags associated with expired snapshots
+            Whether to delete tags whose tip points at an expired snapshot.
 
         Returns
         -------
@@ -1429,7 +1895,12 @@ class Repository:
         )
 
     def rewrite_manifests(
-        self, message: str, *, branch: str, metadata: dict[str, Any] | None = None
+        self,
+        message: str,
+        *,
+        branch: str,
+        metadata: dict[str, Any] | None = None,
+        commit_method: CommitMethod = "new_commit",
     ) -> str:
         """
         Rewrite manifests for all arrays.
@@ -1449,6 +1920,11 @@ class Repository:
             The branch to commit to.
         metadata : dict[str, Any] | None, optional
             Additional metadata to store with the commit snapshot.
+        commit_method : CommitMethod, optional
+            The commit method to use. Defaults to ``"new_commit"``.
+            Use ``"amend"`` to replace the previous commit.
+            Note that ``"amend"`` is only supported for spec version 2
+            repositories.
 
         Returns
         -------
@@ -1457,11 +1933,16 @@ class Repository:
 
         """
         return self._repository.rewrite_manifests(
-            message, branch=branch, metadata=metadata
+            message, branch=branch, metadata=metadata, commit_method=commit_method
         )
 
     async def rewrite_manifests_async(
-        self, message: str, *, branch: str, metadata: dict[str, Any] | None = None
+        self,
+        message: str,
+        *,
+        branch: str,
+        metadata: dict[str, Any] | None = None,
+        commit_method: CommitMethod = "new_commit",
     ) -> str:
         """
         Rewrite manifests for all arrays (async version).
@@ -1481,6 +1962,11 @@ class Repository:
             The branch to commit to.
         metadata : dict[str, Any] | None, optional
             Additional metadata to store with the commit snapshot.
+        commit_method : CommitMethod, optional
+            The commit method to use. Defaults to ``"new_commit"``.
+            Use ``"amend"`` to replace the previous commit.
+            Note that ``"amend"`` is only supported for spec version 2
+            repositories.
 
         Returns
         -------
@@ -1489,7 +1975,7 @@ class Repository:
 
         """
         return await self._repository.rewrite_manifests_async(
-            message, branch=branch, metadata=metadata
+            message, branch=branch, metadata=metadata, commit_method=commit_method
         )
 
     def garbage_collect(
@@ -1499,7 +1985,11 @@ class Repository:
         dry_run: bool = False,
         max_snapshots_in_memory: int = 50,
         max_compressed_manifest_mem_bytes: int = 512 * 1024 * 1024,
+        max_decoded_manifest_mem_bytes: int = 4 * 1024 * 1024 * 1024,
         max_concurrent_manifest_fetches: int = 500,
+        max_concurrent_deletes: int = 10,
+        max_consecutive_delete_failures: int = 50,
+        max_concurrent_listings: int | None = None,
     ) -> GCSummary:
         """Delete any objects no longer accessible from any branches or tags.
 
@@ -1513,20 +2003,52 @@ class Repository:
         Parameters
         ----------
         delete_object_older_than: datetime.datetime
-            Delete objects older than this time.
+            Delete objects older than this time. The bound is exclusive. An
+            object is deleted only if it is also not referenced by any surviving
+            (non-expired) snapshot.
         dry_run: bool : bool
             Report results but don't delete any objects
         max_snapshots_in_memory : int
             Don't prefetch more than this many Snapshots to memory.
         max_compressed_manifest_mem_bytes : int
-            Don't use more than this memory to store compressed in-flight manifests.
+            Don't use more than this memory to store compressed in-flight
+            manifests; see also `max_decoded_manifest_mem_bytes`.
+        max_decoded_manifest_mem_bytes : int
+            Keep the decoded manifests held in memory around this budget.
+            Manifests can grow many times over when decoded, so this, not the
+            compressed budget, is usually what bounds the memory manifests use.
+            The bound is approximate: the reservations are estimates, and a
+            single manifest larger than the whole budget is still processed, on
+            its own. It covers manifest bytes only, not the chunk id set the
+            walk accumulates, which dominates on repositories with millions of
+            chunks.
         max_concurrent_manifest_fetches : int
             Don't run more than this many concurrent manifest fetches.
+        max_concurrent_deletes : int
+            Ceiling on concurrent delete requests. It is not the rate the run
+            uses: garbage collection starts at one request in flight and ramps
+            up until the store throttles it or this ceiling is reached, then
+            keeps adjusting. Raising it only helps on prefixes the store has
+            already partitioned, and never causes an abort.
+        max_consecutive_delete_failures : int
+            Give up, with an error, after this many delete requests fail in a row.
+            Isolated failures are reported in the returned summary and don't stop
+            the run. Throttling is not a failure: it only counts here once the
+            store keeps throttling after the back-off between retries has grown
+            to its maximum.
+        max_concurrent_listings : int | None
+            How many object listings to run concurrently while looking for
+            garbage. Must be at least 1. Defaults to eight per available core,
+            between 32 and 256.
 
         Returns
         -------
         GCSummary
-            Summary of objects deleted.
+            Summary of objects deleted. Deletes that failed are counted in
+            `objects_failed_to_delete`; if a phase had failures, later phases are
+            skipped and listed in `skipped_phases`, so the next run can delete
+            them in a safe order. Requests the store asked us to slow down are
+            counted in `throttled_batches`; they were retried, not failed.
         """
 
         return self._repository.garbage_collect(
@@ -1534,7 +2056,11 @@ class Repository:
             dry_run=dry_run,
             max_snapshots_in_memory=max_snapshots_in_memory,
             max_compressed_manifest_mem_bytes=max_compressed_manifest_mem_bytes,
+            max_decoded_manifest_mem_bytes=max_decoded_manifest_mem_bytes,
             max_concurrent_manifest_fetches=max_concurrent_manifest_fetches,
+            max_concurrent_deletes=max_concurrent_deletes,
+            max_consecutive_delete_failures=max_consecutive_delete_failures,
+            max_concurrent_listings=max_concurrent_listings,
         )
 
     async def garbage_collect_async(
@@ -1544,7 +2070,11 @@ class Repository:
         dry_run: bool = False,
         max_snapshots_in_memory: int = 50,
         max_compressed_manifest_mem_bytes: int = 512 * 1024 * 1024,
+        max_decoded_manifest_mem_bytes: int = 4 * 1024 * 1024 * 1024,
         max_concurrent_manifest_fetches: int = 500,
+        max_concurrent_deletes: int = 10,
+        max_consecutive_delete_failures: int = 50,
+        max_concurrent_listings: int | None = None,
     ) -> GCSummary:
         """Delete any objects no longer accessible from any branches or tags (async version).
 
@@ -1558,20 +2088,52 @@ class Repository:
         Parameters
         ----------
         delete_object_older_than: datetime.datetime
-            Delete objects older than this time.
+            Delete objects older than this time. The bound is exclusive. An
+            object is deleted only if it is also not referenced by any surviving
+            (non-expired) snapshot.
         dry_run: bool : bool
             Report results but don't delete any objects
         max_snapshots_in_memory : int
             Don't prefetch more than this many Snapshots to memory.
         max_compressed_manifest_mem_bytes : int
-            Don't use more than this memory to store compressed in-flight manifests.
+            Don't use more than this memory to store compressed in-flight
+            manifests; see also `max_decoded_manifest_mem_bytes`.
+        max_decoded_manifest_mem_bytes : int
+            Keep the decoded manifests held in memory around this budget.
+            Manifests can grow many times over when decoded, so this, not the
+            compressed budget, is usually what bounds the memory manifests use.
+            The bound is approximate: the reservations are estimates, and a
+            single manifest larger than the whole budget is still processed, on
+            its own. It covers manifest bytes only, not the chunk id set the
+            walk accumulates, which dominates on repositories with millions of
+            chunks.
         max_concurrent_manifest_fetches : int
             Don't run more than this many concurrent manifest fetches.
+        max_concurrent_deletes : int
+            Ceiling on concurrent delete requests. It is not the rate the run
+            uses: garbage collection starts at one request in flight and ramps
+            up until the store throttles it or this ceiling is reached, then
+            keeps adjusting. Raising it only helps on prefixes the store has
+            already partitioned, and never causes an abort.
+        max_consecutive_delete_failures : int
+            Give up, with an error, after this many delete requests fail in a row.
+            Isolated failures are reported in the returned summary and don't stop
+            the run. Throttling is not a failure: it only counts here once the
+            store keeps throttling after the back-off between retries has grown
+            to its maximum.
+        max_concurrent_listings : int | None
+            How many object listings to run concurrently while looking for
+            garbage. Must be at least 1. Defaults to eight per available core,
+            between 32 and 256.
 
         Returns
         -------
         GCSummary
-            Summary of objects deleted.
+            Summary of objects deleted. Deletes that failed are counted in
+            `objects_failed_to_delete`; if a phase had failures, later phases are
+            skipped and listed in `skipped_phases`, so the next run can delete
+            them in a safe order. Requests the store asked us to slow down are
+            counted in `throttled_batches`; they were retried, not failed.
         """
 
         return await self._repository.garbage_collect_async(
@@ -1579,6 +2141,100 @@ class Repository:
             dry_run=dry_run,
             max_snapshots_in_memory=max_snapshots_in_memory,
             max_compressed_manifest_mem_bytes=max_compressed_manifest_mem_bytes,
+            max_decoded_manifest_mem_bytes=max_decoded_manifest_mem_bytes,
+            max_concurrent_manifest_fetches=max_concurrent_manifest_fetches,
+            max_concurrent_deletes=max_concurrent_deletes,
+            max_consecutive_delete_failures=max_consecutive_delete_failures,
+            max_concurrent_listings=max_concurrent_listings,
+        )
+
+    def chunk_storage_stats(
+        self,
+        *,
+        max_snapshots_in_memory: int = 50,
+        max_compressed_manifest_mem_bytes: int = 512 * 1024 * 1024,
+        max_decoded_manifest_mem_bytes: int = 4 * 1024 * 1024 * 1024,
+        max_concurrent_manifest_fetches: int = 500,
+    ) -> ChunkStorageStats:
+        """Calculate the total storage used for chunks, in bytes.
+
+        It reports the storage needed to store all snapshots in the repository that
+        are reachable from any branches or tags. Unreachable snapshots can be generated
+        by using `reset_branch` or `expire_snapshots`. The chunks for these snapshots
+        are not included in the result, and they should probably be deleted using
+        `garbage_collection`.
+
+        The result is a dataclass with attributes for storage consumed by different
+        types of chunks (e.g. `native_bytes`, `virtual_bytes`, `total_bytes`).
+
+        Parameters
+        ----------
+        max_snapshots_in_memory: int
+            Don't prefetch more than this many Snapshots to memory.
+        max_compressed_manifest_mem_bytes : int
+            Don't use more than this memory to store compressed in-flight
+            manifests; see also `max_decoded_manifest_mem_bytes`.
+        max_decoded_manifest_mem_bytes : int
+            Keep the decoded manifests held in memory around this budget.
+            Manifests can grow many times over when decoded, so this, not the
+            compressed budget, is usually what bounds the memory manifests use.
+            The bound is approximate: the reservations are estimates, and a
+            single manifest larger than the whole budget is still processed, on
+            its own. It covers manifest bytes only, not the chunk id set the
+            walk accumulates, which dominates on repositories with millions of
+            chunks.
+        max_concurrent_manifest_fetches : int
+            Don't run more than this many concurrent manifest fetches.
+        """
+        return self._repository.chunk_storage_stats(
+            max_snapshots_in_memory=max_snapshots_in_memory,
+            max_compressed_manifest_mem_bytes=max_compressed_manifest_mem_bytes,
+            max_decoded_manifest_mem_bytes=max_decoded_manifest_mem_bytes,
+            max_concurrent_manifest_fetches=max_concurrent_manifest_fetches,
+        )
+
+    async def chunk_storage_stats_async(
+        self,
+        *,
+        max_snapshots_in_memory: int = 50,
+        max_compressed_manifest_mem_bytes: int = 512 * 1024 * 1024,
+        max_decoded_manifest_mem_bytes: int = 4 * 1024 * 1024 * 1024,
+        max_concurrent_manifest_fetches: int = 500,
+    ) -> ChunkStorageStats:
+        """Calculate the total storage used for chunks, in bytes (async version).
+
+        It reports the storage needed to store all snapshots in the repository that
+        are reachable from any branches or tags. Unreachable snapshots can be generated
+        by using `reset_branch` or `expire_snapshots`. The chunks for these snapshots
+        are not included in the result, and they should probably be deleted using
+        `garbage_collection`.
+
+        The result is a dataclass with attributes for storage consumed by different
+        types of chunks (e.g. `native_bytes`, `virtual_bytes`, `total_bytes`).
+
+        Parameters
+        ----------
+        max_snapshots_in_memory: int
+            Don't prefetch more than this many Snapshots to memory.
+        max_compressed_manifest_mem_bytes : int
+            Don't use more than this memory to store compressed in-flight
+            manifests; see also `max_decoded_manifest_mem_bytes`.
+        max_decoded_manifest_mem_bytes : int
+            Keep the decoded manifests held in memory around this budget.
+            Manifests can grow many times over when decoded, so this, not the
+            compressed budget, is usually what bounds the memory manifests use.
+            The bound is approximate: the reservations are estimates, and a
+            single manifest larger than the whole budget is still processed, on
+            its own. It covers manifest bytes only, not the chunk id set the
+            walk accumulates, which dominates on repositories with millions of
+            chunks.
+        max_concurrent_manifest_fetches : int
+            Don't run more than this many concurrent manifest fetches.
+        """
+        return await self._repository.chunk_storage_stats_async(
+            max_snapshots_in_memory=max_snapshots_in_memory,
+            max_compressed_manifest_mem_bytes=max_compressed_manifest_mem_bytes,
+            max_decoded_manifest_mem_bytes=max_decoded_manifest_mem_bytes,
             max_concurrent_manifest_fetches=max_concurrent_manifest_fetches,
         )
 
@@ -1587,9 +2243,10 @@ class Repository:
         *,
         max_snapshots_in_memory: int = 50,
         max_compressed_manifest_mem_bytes: int = 512 * 1024 * 1024,
+        max_decoded_manifest_mem_bytes: int = 4 * 1024 * 1024 * 1024,
         max_concurrent_manifest_fetches: int = 500,
     ) -> int:
-        """Calculate the total storage used for chunks, in bytes .
+        """Calculate the total storage used for chunks, in bytes.
 
         It reports the storage needed to store all snapshots in the repository that
         are reachable from any branches or tags. Unreachable snapshots can be generated
@@ -1604,22 +2261,44 @@ class Repository:
         max_snapshots_in_memory: int
             Don't prefetch more than this many Snapshots to memory.
         max_compressed_manifest_mem_bytes : int
-            Don't use more than this memory to store compressed in-flight manifests.
+            Don't use more than this memory to store compressed in-flight
+            manifests; see also `max_decoded_manifest_mem_bytes`.
+        max_decoded_manifest_mem_bytes : int
+            Keep the decoded manifests held in memory around this budget.
+            Manifests can grow many times over when decoded, so this, not the
+            compressed budget, is usually what bounds the memory manifests use.
+            The bound is approximate: the reservations are estimates, and a
+            single manifest larger than the whole budget is still processed, on
+            its own. It covers manifest bytes only, not the chunk id set the
+            walk accumulates, which dominates on repositories with millions of
+            chunks.
         max_concurrent_manifest_fetches : int
             Don't run more than this many concurrent manifest fetches.
         """
 
-        return self._repository.total_chunks_storage(
+        warnings.warn(
+            "The ``total_chunks_storage`` method has been deprecated in favour of the ``chunk_storage_stats`` method. "
+            "The new method is superior, as it actually calculates storage size occupied by inlined and virtual chunks in addition to native chunks. "
+            "You can still access just the total native bytes: to keep your existing behaviour using API that will not be removed in a future version, "
+            "please replace your existing ``.total_chunks_storage(**kwargs)`` method call with ``.chunk_storage_stats(**same_kwargs).native_bytes``.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+        stats = self._repository.chunk_storage_stats(
             max_snapshots_in_memory=max_snapshots_in_memory,
             max_compressed_manifest_mem_bytes=max_compressed_manifest_mem_bytes,
+            max_decoded_manifest_mem_bytes=max_decoded_manifest_mem_bytes,
             max_concurrent_manifest_fetches=max_concurrent_manifest_fetches,
         )
+        return stats.native_bytes
 
     async def total_chunks_storage_async(
         self,
         *,
         max_snapshots_in_memory: int = 50,
         max_compressed_manifest_mem_bytes: int = 512 * 1024 * 1024,
+        max_decoded_manifest_mem_bytes: int = 4 * 1024 * 1024 * 1024,
         max_concurrent_manifest_fetches: int = 500,
     ) -> int:
         """Calculate the total storage used for chunks, in bytes (async version).
@@ -1637,24 +2316,295 @@ class Repository:
         max_snapshots_in_memory: int
             Don't prefetch more than this many Snapshots to memory.
         max_compressed_manifest_mem_bytes : int
-            Don't use more than this memory to store compressed in-flight manifests.
+            Don't use more than this memory to store compressed in-flight
+            manifests; see also `max_decoded_manifest_mem_bytes`.
+        max_decoded_manifest_mem_bytes : int
+            Keep the decoded manifests held in memory around this budget.
+            Manifests can grow many times over when decoded, so this, not the
+            compressed budget, is usually what bounds the memory manifests use.
+            The bound is approximate: the reservations are estimates, and a
+            single manifest larger than the whole budget is still processed, on
+            its own. It covers manifest bytes only, not the chunk id set the
+            walk accumulates, which dominates on repositories with millions of
+            chunks.
         max_concurrent_manifest_fetches : int
             Don't run more than this many concurrent manifest fetches.
         """
 
-        return await self._repository.total_chunks_storage_async(
-            max_snapshots_in_memory=max_snapshots_in_memory,
-            max_compressed_manifest_mem_bytes=max_compressed_manifest_mem_bytes,
-            max_concurrent_manifest_fetches=max_concurrent_manifest_fetches,
+        warnings.warn(
+            "The ``total_chunks_storage_async`` method has been deprecated in favour of the ``chunk_storage_stats_async`` method. "
+            "The new method is superior, as it actually calculates storage size occupied by inlined and virtual chunks in addition to native chunks. "
+            "You can still access just the total native bytes: to keep your existing behaviour using API that will not be removed in a future version, "
+            "please replace your existing ``.total_chunks_storage_async(**kwargs)`` method call with ``.chunk_storage_stats_async(**same_kwargs).native_bytes``.",
+            DeprecationWarning,
+            stacklevel=2,
         )
 
-    def inspect_snapshot(self, snapshot_id: str, *, pretty: bool = True) -> str:
-        return self._repository.inspect_snapshot(snapshot_id, pretty=pretty)
+        stats = await self._repository.chunk_storage_stats_async(
+            max_snapshots_in_memory=max_snapshots_in_memory,
+            max_compressed_manifest_mem_bytes=max_compressed_manifest_mem_bytes,
+            max_decoded_manifest_mem_bytes=max_decoded_manifest_mem_bytes,
+            max_concurrent_manifest_fetches=max_concurrent_manifest_fetches,
+        )
+        return stats.native_bytes
 
-    async def inspect_snapshot_async(
-        self, snapshot_id: str, *, pretty: bool = True
-    ) -> str:
-        return await self._repository.inspect_snapshot_async(snapshot_id, pretty=pretty)
+    def inspect_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        """
+        Return the node tree stored in a snapshot.
 
-    def spec_version(self) -> int:
-        return self._repository.spec_version()
+        The result contains every node's path, node ID, type (array or group),
+        and manifest references. Useful for verifying node identity across
+        commits or inspecting what a snapshot contains.
+
+        This is a testing/debugging utility. The return type and structure
+        may change in future versions.
+
+        Parameters
+        ----------
+        snapshot_id : str
+            The snapshot to inspect.
+
+        Returns
+        -------
+        dict[str, Any]
+            Keys: ``id``, ``header``, ``flushed_at``, ``commit_message``,
+            ``metadata``, ``manifests``, ``nodes``.
+
+            See :meth:`inspect_repo_info` for the contents of ``header``.
+        """
+        result: dict[str, Any] = json.loads(
+            self._repository.inspect_snapshot(snapshot_id, pretty=False)
+        )
+        return result
+
+    async def inspect_snapshot_async(self, snapshot_id: str) -> dict[str, Any]:
+        """
+        Return the node tree stored in a snapshot.
+
+        The result contains every node's path, node ID, type (array or group),
+        and manifest references. Useful for verifying node identity across
+        commits or inspecting what a snapshot contains.
+
+        This is a testing/debugging utility. The return type and structure
+        may change in future versions.
+
+        Parameters
+        ----------
+        snapshot_id : str
+            The snapshot to inspect.
+
+        Returns
+        -------
+        dict[str, Any]
+            Keys: ``id``, ``header``, ``flushed_at``, ``commit_message``,
+            ``metadata``, ``manifests``, ``nodes``.
+
+            See :meth:`inspect_repo_info` for the contents of ``header``.
+        """
+        result: dict[str, Any] = json.loads(
+            await self._repository.inspect_snapshot_async(snapshot_id, pretty=False)
+        )
+        return result
+
+    def inspect_repo_info(self) -> dict[str, Any]:
+        """
+        Return the top-level repository metadata.
+
+        Includes the branch-to-snapshot mapping, tags, snapshot ancestry,
+        and the recent update log.
+
+        This is a testing/debugging utility. The return type and structure
+        may change in future versions.
+
+        Returns
+        -------
+        dict[str, Any]
+            Keys: ``header``, ``spec_version``, ``branches``, ``tags``,
+            ``deleted_tags``, ``snapshots``, ``metadata``, ``latest_updates``.
+
+            Every ``inspect_*`` method reports a ``header`` describing the
+            binary header of the file it read. Keys: ``written_by`` (the
+            library that wrote that file, e.g. ``ic-2.1.0``), ``app_name``,
+            ``app_version``, ``spec_version`` (the version of that file, which
+            can be older than the repository's after a migration),
+            ``file_type`` and ``compression``.
+        """
+        result: dict[str, Any] = json.loads(
+            self._repository.inspect_repo_info(pretty=False)
+        )
+        return result
+
+    async def inspect_repo_info_async(self) -> dict[str, Any]:
+        """
+        Return the top-level repository metadata.
+
+        Includes the branch-to-snapshot mapping, tags, snapshot ancestry,
+        and the recent update log.
+
+        This is a testing/debugging utility. The return type and structure
+        may change in future versions.
+
+        Returns
+        -------
+        dict[str, Any]
+            Keys: ``header``, ``spec_version``, ``branches``, ``tags``,
+            ``deleted_tags``, ``snapshots``, ``metadata``, ``latest_updates``.
+
+            Every ``inspect_*`` method reports a ``header`` describing the
+            binary header of the file it read. Keys: ``written_by`` (the
+            library that wrote that file, e.g. ``ic-2.1.0``), ``app_name``,
+            ``app_version``, ``spec_version`` (the version of that file, which
+            can be older than the repository's after a migration),
+            ``file_type`` and ``compression``.
+        """
+        result: dict[str, Any] = json.loads(
+            await self._repository.inspect_repo_info_async(pretty=False)
+        )
+        return result
+
+    def inspect_manifest(self, manifest_id: str) -> dict[str, Any]:
+        """
+        Return chunk storage statistics for a manifest.
+
+        Shows per-array chunk counts broken down by storage type
+        (inline, native, virtual) and compression details.
+
+        This is a testing/debugging utility. The return type and structure
+        may change in future versions.
+
+        Parameters
+        ----------
+        manifest_id : str
+            The manifest to inspect. Manifest IDs can be found in the
+            ``manifest_refs`` of array nodes returned by
+            :meth:`inspect_snapshot`.
+
+        Returns
+        -------
+        dict[str, Any]
+            Keys: ``id``, ``header``, ``size_bytes``, ``num_arrays``,
+            ``total_chunk_refs``, ``total_inline``, ``total_native``,
+            ``total_virtual``, ``arrays``, ``compression``.
+
+            See :meth:`inspect_repo_info` for the contents of ``header``.
+        """
+        result: dict[str, Any] = json.loads(
+            self._repository.inspect_manifest(manifest_id, pretty=False)
+        )
+        return result
+
+    async def inspect_manifest_async(self, manifest_id: str) -> dict[str, Any]:
+        """
+        Return chunk storage statistics for a manifest.
+
+        Shows per-array chunk counts broken down by storage type
+        (inline, native, virtual) and compression details.
+
+        This is a testing/debugging utility. The return type and structure
+        may change in future versions.
+
+        Parameters
+        ----------
+        manifest_id : str
+            The manifest to inspect. Manifest IDs can be found in the
+            ``manifest_refs`` of array nodes returned by
+            :meth:`inspect_snapshot_async`.
+
+        Returns
+        -------
+        dict[str, Any]
+            Keys: ``id``, ``header``, ``size_bytes``, ``num_arrays``,
+            ``total_chunk_refs``, ``total_inline``, ``total_native``,
+            ``total_virtual``, ``arrays``, ``compression``.
+
+            See :meth:`inspect_repo_info` for the contents of ``header``.
+        """
+        result: dict[str, Any] = json.loads(
+            await self._repository.inspect_manifest_async(manifest_id, pretty=False)
+        )
+        return result
+
+    def inspect_transaction_log(self, snapshot_id: str) -> dict[str, Any]:
+        """
+        Return the record of what changed in a single commit.
+
+        Lists the node IDs of every created, deleted, and updated node,
+        the chunk coordinates that were written, and any move operations.
+
+        This is a testing/debugging utility. The return type and structure
+        may change in future versions.
+
+        Parameters
+        ----------
+        snapshot_id : str
+            The snapshot whose transaction log to inspect.
+
+        Returns
+        -------
+        dict[str, Any]
+            Keys: ``header``, ``new_groups``, ``new_arrays``,
+            ``deleted_groups``, ``deleted_arrays``, ``updated_groups``,
+            ``updated_arrays``, ``updated_chunks``, ``moved_nodes``.
+
+            See :meth:`inspect_repo_info` for the contents of ``header``.
+
+            When the snapshot's ancestry was collapsed by expiration, an
+            additional ``synthetic_composite`` key is present. It shows
+            the transaction log is not a single on-disk file but a
+            synthetic merge. Keys: ``note`` (a field text explanation),
+            ``merged_pruned_ancestor_tx_logs`` (the pruned-ancestor
+            transaction logs merged into this one, oldest first), and
+            ``missing_tx_logs`` (referenced pruned-ancestor logs absent from
+            storage, expected only when an older GC deleted them). In that
+            case ``header`` describes the snapshot's own log; the merged
+            logs have headers of their own, not reported here.
+        """
+        result: dict[str, Any] = json.loads(
+            self._repository.inspect_transaction_log(snapshot_id, pretty=False)
+        )
+        return result
+
+    async def inspect_transaction_log_async(self, snapshot_id: str) -> dict[str, Any]:
+        """
+        Return the record of what changed in a single commit.
+
+        Lists the node IDs of every created, deleted, and updated node,
+        the chunk coordinates that were written, and any move operations.
+
+        This is a testing/debugging utility. The return type and structure
+        may change in future versions.
+
+        Parameters
+        ----------
+        snapshot_id : str
+            The snapshot whose transaction log to inspect.
+
+        Returns
+        -------
+        dict[str, Any]
+            Keys: ``header``, ``new_groups``, ``new_arrays``,
+            ``deleted_groups``, ``deleted_arrays``, ``updated_groups``,
+            ``updated_arrays``, ``updated_chunks``, ``moved_nodes``.
+
+            See :meth:`inspect_repo_info` for the contents of ``header``.
+
+            When the snapshot's ancestry was collapsed by expiration, an
+            additional ``synthetic_composite`` key is present. It shows
+            the transaction log is not a single on-disk file but a
+            synthetic merge. Keys: ``note`` (a field text explanation),
+            ``merged_pruned_ancestor_tx_logs`` (the pruned-ancestor
+            transaction logs merged into this one, oldest first), and
+            ``missing_tx_logs`` (referenced pruned-ancestor logs absent from
+            storage, expected only when an older GC deleted them). In that
+            case ``header`` describes the snapshot's own log; the merged
+            logs have headers of their own, not reported here.
+        """
+        raw = await self._repository.inspect_transaction_log_async(
+            snapshot_id, pretty=False
+        )
+        result: dict[str, Any] = json.loads(raw)
+        return result
+
+    @property
+    def spec_version(self) -> SpecVersion:
+        return self._repository.spec_version

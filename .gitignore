@@ -1,4 +1,5 @@
 /target
+/msrv-target
 
 # macOS
 .DS_Store
@@ -23,3 +24,19 @@ icechunk-python/uv.lock
 
 # Jetbrains IDE
 .idea/
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+.cache/
+
+# Coverage reports
+*.lcov
+coverage.xml
+.coverage
+htmlcov/
+*.profraw
+
+# upstream-check clones (just zarrs-upstream / xarray-upstream)
+/zarrs_icechunk/
+/xarray/
